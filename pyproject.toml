@@ -1,18 +1,18 @@
 [project]
 name = "dendrite-scraper"
 version = "0.2.0"  # x-release-please-version
-description = "Web scraping service with anti-bot detection, Jina fallback, and LLM cleanup"
+description = "Web scraping service with anti-bot detection, Jina fallback, and model cleanup"
 license = "MIT"
 authors = [{ name = "Kevin Frilot" }]
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "crawl4ai>=0.8.0",
-    "fastapi>=0.115.0",
+    "crawl4ai>=0.8.9",
+    "fastapi>=0.136.3",
     "httpx>=0.27.0",
-    "pydantic>=2.0.0",
-    "pydantic-settings>=2.0.0",
-    "uvicorn>=0.32.0",
+    "pydantic>=2.13.4",
+    "pydantic-settings>=2.14.1",
+    "uvicorn>=0.49.0",
 ]
 
 [build-system]
@@ -27,11 +27,17 @@ dendrite-scraper = "dendrite_scraper.cli:main"
 
 [dependency-groups]
 dev = [
-    "pytest>=8.0.0",
-    "pytest-asyncio>=0.24.0",
-    "pytest-httpx>=0.34.0",
-    "ruff>=0.8.0",
-    "ty>=0.0.21",
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.4.0",
+    "pytest-httpx>=0.36.2",
+    "ruff>=0.15.16",
+    "ty>=0.0.44",
+]
+
+[tool.uv]
+override-dependencies = [
+    # crawl4ai 0.8.9 still declares lxml ~=5.3; force the patched line.
+    "lxml>=6.1.1",
 ]
 
 [tool.ruff]
