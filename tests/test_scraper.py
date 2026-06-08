@@ -19,12 +19,15 @@ import dendrite_scraper.scraper as scraper_module
 from dendrite_scraper.scraper import (
     clean_markdown_content,
     crawl_url,
+    find_hector_resident_target,
+    hector_clean_markdown,
     is_scrape_artifact_line,
     jina_fetch,
     llm_clean_markdown,
     looks_like_bot_block,
     looks_noisy,
     maybe_llm_clean,
+    resolve_cleanup_provider,
     scrape,
 )
 
@@ -88,7 +91,7 @@ class FakeCrawler:
 
 
 class FakeResponse:
-    """HTTP response stub used by Jina and OpenAI tests.
+    """HTTP response stub used by HTTP client tests.
 
     @param status_code: Response status code.
     @param text: Response body text.
@@ -186,6 +189,22 @@ class FakeAsyncClient:
             raise self.post_error
         assert self.post_response is not None
         return self.post_response
+
+
+class FakeHectorTarget:
+    """Minimal Hector target stub with release tracking."""
+
+    def __init__(self) -> None:
+        self.released = False
+        self.release_sweep: bool | None = None
+
+    def release(self, *, sweep: bool = False) -> None:
+        """Record release calls made by the Hector cleanup path.
+
+        @param sweep: Whether cleanup requested a Hector sweep.
+        """
+        self.released = True
+        self.release_sweep = sweep
 
 
 # ── Helper builders ──────────────────────────────────────────
@@ -517,80 +536,114 @@ class TestJinaFetch:
 # ── llm_clean_markdown ───────────────────────────────────────
 
 
-class TestLlmCleanMarkdown:
-    """Tests for the OpenAI cleanup call."""
+class TestHectorCleanMarkdown:
+    """Tests for the Hector cleanup call."""
 
     @pytest.mark.asyncio
-    async def test_no_api_key_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(scraper_module.settings, "openai_api_key", None)
-        assert await llm_clean_markdown("# Hello\n") is None
+    async def test_success_releases_lease(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        target = FakeHectorTarget()
+        calls: dict[str, object] = {}
+        fake_hector = ModuleType("hector")
 
-    @pytest.mark.asyncio
-    async def test_success_and_input_truncation(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        client = FakeAsyncClient(
-            post_response=FakeResponse(
-                status_code=200,
-                json_data={"choices": [{"message": {"content": "# Clean\n"}}]},
-            )
-        )
-        monkeypatch.setattr(scraper_module.settings, "openai_api_key", "test-key")
+        def ensure(**kwargs: object) -> FakeHectorTarget:
+            calls["ensure"] = kwargs
+            return target
+
+        def chat(_target: FakeHectorTarget, messages: object, **kwargs: object) -> dict[str, object]:
+            calls["messages"] = messages
+            calls["chat"] = kwargs
+            return {"choices": [{"message": {"content": "# Local clean\n"}}]}
+
+        fake_hector.__dict__["ensure"] = ensure
+        fake_hector.__dict__["chat"] = chat
+        monkeypatch.setitem(sys.modules, "hector", fake_hector)
+        monkeypatch.setattr(scraper_module.settings, "hector_provider", "mlx")
+        monkeypatch.setattr(scraper_module.settings, "hector_model", "local-model")
         monkeypatch.setattr(scraper_module.settings, "llm_clean_max_input_chars", 5)
 
-        with patch("dendrite_scraper.scraper.httpx.AsyncClient", return_value=client):
-            cleaned = await llm_clean_markdown("123456789")
+        cleaned = await hector_clean_markdown("123456789")
 
-        assert cleaned == "# Clean\n"
-        assert client.last_post is not None
-        payload = cast(dict[str, Any], client.last_post[1]["json"])
-        messages = cast(list[dict[str, Any]], payload["messages"])
+        assert cleaned == "# Local clean\n"
+        assert target.released is True
+        assert calls["ensure"] == {
+            "provider": "mlx",
+            "model": "local-model",
+            "app_name": "dendrite-scraper",
+            "sweep_on_exit": False,
+            "timeout": 180.0,
+        }
+        messages = cast(list[dict[str, str]], calls["messages"])
         assert messages[1]["content"] == "12345"
 
     @pytest.mark.asyncio
-    async def test_http_error_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        client = FakeAsyncClient(post_error=httpx.HTTPError("boom"))
-        monkeypatch.setattr(scraper_module.settings, "openai_api_key", "test-key")
+    async def test_missing_sdk_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delitem(sys.modules, "hector", raising=False)
+        monkeypatch.setattr(scraper_module.settings, "hector_provider", "mlx")
+        monkeypatch.setattr(scraper_module.settings, "hector_model", "local-model")
 
-        with patch("dendrite_scraper.scraper.httpx.AsyncClient", return_value=client):
-            cleaned = await llm_clean_markdown("# Hello\n")
+        assert await hector_clean_markdown("# Hello\n") is None
 
-        assert cleaned is None
+    def test_resident_target_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake_hector = ModuleType("hector")
+
+        def info(**_kwargs: object) -> dict[str, object]:
+            return {
+                "residentModels": [
+                    {
+                        "baseUrl": "http://127.0.0.1:18086/v1",
+                        "model": "local-model",
+                        "provider": "mlx",
+                    }
+                ]
+            }
+
+        fake_hector.__dict__["info"] = info
+        monkeypatch.setattr(scraper_module.settings, "hector_provider", "mlx")
+        monkeypatch.setattr(scraper_module.settings, "hector_model", "local-model")
+
+        target = find_hector_resident_target(fake_hector)
+
+        assert target is not None
+        target_attrs = cast(Any, target)
+        assert target_attrs.base_url == "http://127.0.0.1:18086/v1"
+        assert target_attrs.model == "local-model"
+
+
+class TestCleanupProvider:
+    """Tests for cleanup provider selection."""
+
+    def test_auto_prefers_hector_when_configured(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scraper_module.settings, "cleanup_provider", "auto")
+        monkeypatch.setattr(scraper_module.settings, "hector_provider", "mlx")
+        monkeypatch.setattr(scraper_module.settings, "hector_model", "local-model")
+
+        assert resolve_cleanup_provider() == "hector"
+
+    def test_auto_without_hector_disables_cleanup(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scraper_module.settings, "cleanup_provider", "auto")
+        monkeypatch.setattr(scraper_module.settings, "hector_provider", None)
+        monkeypatch.setattr(scraper_module.settings, "hector_model", None)
+
+        assert resolve_cleanup_provider() == "none"
+
+    def test_none_disables_cleanup(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scraper_module.settings, "cleanup_provider", "none")
+        monkeypatch.setattr(scraper_module.settings, "hector_provider", "mlx")
+        monkeypatch.setattr(scraper_module.settings, "hector_model", "local-model")
+
+        assert resolve_cleanup_provider() == "none"
 
     @pytest.mark.asyncio
-    async def test_non_200_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        client = FakeAsyncClient(post_response=FakeResponse(status_code=500, text="nope"))
-        monkeypatch.setattr(scraper_module.settings, "openai_api_key", "test-key")
+    async def test_llm_clean_dispatches_to_hector(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scraper_module.settings, "cleanup_provider", "hector")
+        monkeypatch.setattr(scraper_module.settings, "hector_provider", "mlx")
+        monkeypatch.setattr(scraper_module.settings, "hector_model", "local-model")
 
-        with patch("dendrite_scraper.scraper.httpx.AsyncClient", return_value=client):
-            cleaned = await llm_clean_markdown("# Hello\n")
-
-        assert cleaned is None
-
-    @pytest.mark.asyncio
-    async def test_bad_json_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        client = FakeAsyncClient(
-            post_response=FakeResponse(status_code=200, json_error=ValueError())
-        )
-        monkeypatch.setattr(scraper_module.settings, "openai_api_key", "test-key")
-
-        with patch("dendrite_scraper.scraper.httpx.AsyncClient", return_value=client):
-            cleaned = await llm_clean_markdown("# Hello\n")
-
-        assert cleaned is None
-
-    @pytest.mark.asyncio
-    async def test_empty_content_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        client = FakeAsyncClient(
-            post_response=FakeResponse(
-                status_code=200,
-                json_data={"choices": [{"message": {"content": "   "}}]},
-            )
-        )
-        monkeypatch.setattr(scraper_module.settings, "openai_api_key", "test-key")
-
-        with patch("dendrite_scraper.scraper.httpx.AsyncClient", return_value=client):
-            cleaned = await llm_clean_markdown("# Hello\n")
-
-        assert cleaned is None
+        with patch(
+            "dendrite_scraper.scraper.hector_clean_markdown",
+            new=AsyncMock(return_value="# Local\n"),
+        ):
+            assert await llm_clean_markdown("# Raw\n") == "# Local\n"
 
 
 # ── maybe_llm_clean ──────────────────────────────────────────
@@ -601,7 +654,9 @@ class TestMaybeLlmClean:
 
     @pytest.mark.asyncio
     async def test_non_noisy_skips_llm(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(scraper_module.settings, "openai_api_key", "test-key")
+        monkeypatch.setattr(scraper_module.settings, "cleanup_provider", "hector")
+        monkeypatch.setattr(scraper_module.settings, "hector_provider", "mlx")
+        monkeypatch.setattr(scraper_module.settings, "hector_model", "local-model")
 
         with patch(
             "dendrite_scraper.scraper.llm_clean_markdown", new_callable=AsyncMock
@@ -613,8 +668,8 @@ class TestMaybeLlmClean:
         mock_clean.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_no_api_key_skips_llm(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(scraper_module.settings, "openai_api_key", None)
+    async def test_no_provider_skips_llm(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scraper_module.settings, "cleanup_provider", "none")
         noisy = "\n".join(f"[Link {i}](https://example.com/{i})" for i in range(20))
 
         with patch(
@@ -628,7 +683,9 @@ class TestMaybeLlmClean:
 
     @pytest.mark.asyncio
     async def test_noisy_content_uses_llm(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(scraper_module.settings, "openai_api_key", "test-key")
+        monkeypatch.setattr(scraper_module.settings, "cleanup_provider", "hector")
+        monkeypatch.setattr(scraper_module.settings, "hector_provider", "mlx")
+        monkeypatch.setattr(scraper_module.settings, "hector_model", "local-model")
         noisy = "\n".join(f"[Link {i}](https://example.com/{i})" for i in range(20))
 
         with patch(
@@ -644,7 +701,9 @@ class TestMaybeLlmClean:
     async def test_llm_failure_falls_back_to_original(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(scraper_module.settings, "openai_api_key", "test-key")
+        monkeypatch.setattr(scraper_module.settings, "cleanup_provider", "hector")
+        monkeypatch.setattr(scraper_module.settings, "hector_provider", "mlx")
+        monkeypatch.setattr(scraper_module.settings, "hector_model", "local-model")
         noisy = "\n".join(f"[Link {i}](https://example.com/{i})" for i in range(20))
 
         with patch("dendrite_scraper.scraper.llm_clean_markdown", new=AsyncMock(return_value=None)):

@@ -1,7 +1,7 @@
 # dendrite-scraper
 
 Web scraping service with anti-bot detection, Jina fallback, and optional
-LLM cleanup. Runs as a standalone service or installs as a Python package.
+model cleanup. Runs as a standalone service or installs as a Python package.
 
 ## Install
 
@@ -40,8 +40,8 @@ GET  /health
 3. **Jina Reader fallback** — free cloud re-fetch when bot-blocked or crawl
    fails
 4. **Noise detection** — link-density heuristic for nav/sidebar chrome
-5. **LLM cleanup** — optional gpt-4o-mini pass to strip non-content noise
-   (requires `OPENAI_API_KEY`)
+5. **Model cleanup** — optional Hector local-model pass to strip
+   non-content noise from noisy markdown
 6. **Artifact stripping** — regex patterns for "Skip to content", GitHub
    chrome, duplicate lines
 
@@ -123,10 +123,20 @@ docker compose up -d
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `OPENAI_API_KEY` | No | Enables gpt-4o-mini content cleanup |
+| `DENDRITE_CLEANUP_PROVIDER` | No | Cleanup backend: `auto`, `none`, or `hector` (default: `auto`) |
+| `DENDRITE_HECTOR_PROVIDER` | No | Hector provider for local cleanup (default: `mlx`) |
+| `DENDRITE_HECTOR_MODEL` | No | Hector model for local cleanup (default: `mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit`) |
 | `DENDRITE_PORT` | No | Server port (default: 8020) |
 | `DENDRITE_HOST` | No | Bind address (default: 0.0.0.0) |
 | `DENDRITE_CRAWL_TIMEOUT_SECONDS` | No | Crawl4AI timeout (default: 25) |
+
+`auto` uses Hector when `DENDRITE_HECTOR_PROVIDER` and
+`DENDRITE_HECTOR_MODEL` are configured; otherwise cleanup is skipped. Set
+`DENDRITE_CLEANUP_PROVIDER=none` to disable model cleanup entirely.
+
+Hector cleanup requires the Hector Python client to be importable by the
+service, for example by installing `~/dev/hector/clients/hector-py` into the
+same environment.
 
 ## Use as a library
 

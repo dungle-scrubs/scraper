@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from pydantic import BaseModel, HttpUrl
 
-from dendrite_scraper.scraper import ScrapeResult, scrape
+from dendrite_scraper.scraper import ScrapeResult, resolve_cleanup_provider, scrape
 from dendrite_scraper.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -23,16 +23,16 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """Log startup configuration."""
     logger.info("dendrite-scraper starting on %s:%d", settings.host, settings.port)
     logger.info(
-        "LLM cleanup: %s",
-        "enabled" if settings.openai_api_key else "disabled (no OPENAI_API_KEY)",
+        "Model cleanup provider: %s",
+        resolve_cleanup_provider(),
     )
     yield
 
 
 app = FastAPI(
     title="dendrite-scraper",
-    description="Scraping service with anti-bot detection, Jina fallback, and LLM cleanup",
-    version="0.1.0",
+    description="Scraping service with anti-bot detection, Jina fallback, and model cleanup",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
@@ -56,7 +56,7 @@ class ScrapeResponse(BaseModel):
     @param source: Which backend produced the content ("crawl4ai", "jina", or "none").
     @param url: The URL that was scraped.
     @param bot_detected: Whether bot protection was detected.
-    @param llm_cleaned: Whether gpt-4o-mini post-processing was applied.
+    @param llm_cleaned: Whether model-backed post-processing was applied.
     @param error: Error message if the scrape failed entirely.
     @param elapsed_ms: Wall-clock time for the full pipeline.
     @param attempts: Log of what was tried.

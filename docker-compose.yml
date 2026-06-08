@@ -5,8 +5,7 @@ services:
       - "8020:8020"
     environment:
       - DENDRITE_PORT=8020
-      # Optional: enables gpt-4o-mini content cleanup pass.
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - DENDRITE_CLEANUP_PROVIDER=${DENDRITE_CLEANUP_PROVIDER:-none}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8020/health').raise_for_status()"]

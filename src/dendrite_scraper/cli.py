@@ -174,7 +174,7 @@ def build_parser() -> argparse.ArgumentParser:
     """
     parser = argparse.ArgumentParser(
         prog="dendrite-scraper",
-        description="Web scraper with anti-bot detection, Jina fallback, and LLM cleanup.",
+        description="Web scraper with anti-bot detection, Jina fallback, and model cleanup.",
     )
     sub = parser.add_subparsers(dest="command")
 

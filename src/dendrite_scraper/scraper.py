@@ -1,4 +1,4 @@
-"""Core scraping pipeline: crawl4ai → bot detection → Jina fallback → LLM cleanup → artifact stripping.
+"""Core scraping pipeline: crawl4ai → bot detection → Jina fallback → model cleanup → artifact stripping.
 
 This module is the entire reason this service exists. It wraps crawl4ai with
 multi-layer resilience and content cleaning that callers shouldn't have to
@@ -9,7 +9,7 @@ Pipeline:
   2. Bot detection — Cloudflare/CAPTCHA phrases + partial JS render heuristic
   3. Jina Reader fallback — free cloud re-fetch when bot-blocked or crawl fails
   4. Noise detection — link-density heuristic for nav/sidebar chrome
-  5. LLM cleanup — optional gpt-4o-mini pass to strip non-content noise
+  5. Model cleanup — optional Hector pass to strip non-content noise
   6. Artifact stripping — regex patterns for common scraper artifacts
 """
 
@@ -19,6 +19,9 @@ import re
 import sys
 import time
 from dataclasses import dataclass, field
+from importlib import import_module
+from types import SimpleNamespace
+from typing import Any, Literal, cast
 
 import httpx
 
@@ -53,6 +56,16 @@ SCRAPE_ARTIFACT_LINE_SUBSTRINGS = (
     "You switched accounts on another tab or window.",
 )
 
+CLEANUP_SYSTEM_PROMPT = (
+    "You are a documentation extractor. Extract ONLY the main documentation content from the "
+    "scraped markdown below. Remove navigation menus, sidebars, footers, cookie notices, ads, "
+    "breadcrumbs, table of contents, sign-in prompts, and any non-documentation chrome. Preserve "
+    "headings, paragraphs, code blocks, lists, tables, links within the content, and all technical "
+    "detail. Return clean markdown only. No commentary."
+)
+
+ResolvedCleanupProvider = Literal["none", "hector"]
+
 
 # ── Result types ─────────────────────────────────────────────
 
@@ -65,7 +78,7 @@ class ScrapeResult:
     @param source: Which backend produced the content.
     @param url: The URL that was scraped.
     @param bot_detected: Whether bot protection was detected on the initial crawl.
-    @param llm_cleaned: Whether gpt-4o-mini post-processing was applied.
+    @param llm_cleaned: Whether model-backed markdown cleanup was applied.
     @param error: Error message if the scrape failed entirely.
     @param elapsed_ms: Wall-clock time for the full pipeline.
     @param attempts: Log of what was tried.
@@ -243,7 +256,7 @@ async def jina_fetch(url: str) -> tuple[str, bool]:
     return markdown, False
 
 
-# ── LLM cleanup ──────────────────────────────────────────────
+# ── Model cleanup ────────────────────────────────────────────
 
 
 def looks_noisy(markdown: str) -> bool:
@@ -253,7 +266,7 @@ def looks_noisy(markdown: str) -> bool:
     HTML-level excluded_tags didn't fully strip navigation chrome.
 
     @param markdown: Raw markdown from crawl4ai or Jina.
-    @returns: True if the content looks noisy enough to benefit from LLM cleanup.
+    @returns: True if the content looks noisy enough to benefit from model cleanup.
     """
     head = markdown[:2000]
     link_count = head.count("](")
@@ -263,75 +276,173 @@ def looks_noisy(markdown: str) -> bool:
     return link_count > line_count / 2
 
 
-async def llm_clean_markdown(raw_markdown: str) -> str | None:
-    """Post-process scraped markdown through gpt-4o-mini for cleaner extraction.
+def resolve_cleanup_provider() -> ResolvedCleanupProvider:
+    """Resolve the configured cleanup provider into an executable backend.
 
-    Strips navigation, sidebars, footers, and non-documentation noise. Returns
-    None on failure so the caller falls back to regex-only cleanup.
+    @returns: Concrete provider name or "none" when cleanup is unavailable.
+    """
+    if settings.cleanup_provider == "none":
+        return "none"
+
+    if settings.cleanup_provider == "hector":
+        return "hector" if settings.hector_provider and settings.hector_model else "none"
+
+    if settings.hector_provider and settings.hector_model:
+        return "hector"
+
+    return "none"
+
+
+def cleanup_messages(raw_markdown: str) -> list[dict[str, str]]:
+    """Build chat messages for the cleanup extraction task.
 
     @param raw_markdown: Raw markdown from crawl4ai or Jina.
-    @returns: Cleaned markdown string, or None if LLM cleanup failed/unavailable.
+    @returns: Chat-completions-compatible messages.
     """
-    if not settings.openai_api_key:
+    truncated = raw_markdown[: settings.llm_clean_max_input_chars]
+    return [
+        {"role": "system", "content": CLEANUP_SYSTEM_PROMPT},
+        {"role": "user", "content": truncated},
+    ]
+
+
+def extract_chat_content(payload: object) -> str | None:
+    """Extract assistant text from a chat-completions-compatible response.
+
+    @param payload: Response JSON payload.
+    @returns: Assistant content or None when the shape is invalid/empty.
+    """
+    if not isinstance(payload, dict):
         return None
 
-    truncated = raw_markdown[: settings.llm_clean_max_input_chars]
+    response = cast(dict[str, object], payload)
+    choices = response.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+
+    first_choice = choices[0]
+    if not isinstance(first_choice, dict):
+        return None
+
+    choice = cast(dict[str, object], first_choice)
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        return None
+
+    chat_message = cast(dict[str, object], message)
+    content = chat_message.get("content")
+    return content if isinstance(content, str) and content.strip() else None
+
+
+def find_hector_resident_target(hector: Any) -> object | None:
+    """Find an already-resident Hector target when direct ensure is policy-blocked.
+
+    @param hector: Imported Hector Python SDK module.
+    @returns: Minimal target object compatible with hector.chat, or None.
+    """
+    try:
+        snapshot = hector.info(timeout=settings.hector_timeout_seconds)
+    except Exception:
+        return None
+
+    if not isinstance(snapshot, dict):
+        return None
+
+    resident_models = snapshot.get("residentModels")
+    if not isinstance(resident_models, list):
+        return None
+
+    for resident in resident_models:
+        if not isinstance(resident, dict):
+            continue
+        if (
+            resident.get("provider") == settings.hector_provider
+            and resident.get("model") == settings.hector_model
+            and isinstance(resident.get("baseUrl"), str)
+            and isinstance(resident.get("model"), str)
+        ):
+            return SimpleNamespace(
+                base_url=resident["baseUrl"],
+                model=resident["model"],
+            )
+
+    return None
+
+
+def hector_clean_markdown_sync(raw_markdown: str) -> str | None:
+    """Post-process scraped markdown through a Hector-resolved local model.
+
+    @param raw_markdown: Raw markdown from crawl4ai or Jina.
+    @returns: Cleaned markdown string, or None if Hector cleanup failed/unavailable.
+    """
+    if not settings.hector_provider or not settings.hector_model:
+        return None
 
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {settings.openai_api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "gpt-4o-mini",
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "You are a documentation extractor. Extract ONLY the main "
-                                "documentation content from the scraped markdown below. "
-                                "Remove: navigation menus, sidebars, footers, cookie notices, "
-                                "ads, breadcrumbs, table of contents, sign-in prompts, and any "
-                                "non-documentation chrome. "
-                                "Preserve: headings, paragraphs, code blocks, lists, tables, "
-                                "links within the content, and all technical detail. "
-                                "Return clean markdown only. No commentary."
-                            ),
-                        },
-                        {"role": "user", "content": truncated},
-                    ],
-                    "max_tokens": 16_000,
-                    "temperature": 0,
-                },
+        hector = cast(Any, import_module("hector"))
+
+        try:
+            target = hector.ensure(
+                provider=settings.hector_provider,
+                model=settings.hector_model,
+                app_name=settings.hector_app_name,
+                sweep_on_exit=settings.hector_sweep_on_exit,
+                timeout=settings.hector_timeout_seconds,
+            )
+        except Exception:
+            target = find_hector_resident_target(hector)
+            if target is None:
+                return None
+
+        try:
+            payload = hector.chat(
+                target,
+                cleanup_messages(raw_markdown),
+                max_tokens=16_000,
+                temperature=0,
                 timeout=settings.llm_clean_timeout_seconds,
             )
-    except (httpx.HTTPError, Exception):
+        finally:
+            release = getattr(target, "release", None)
+            if callable(release):
+                release(sweep=settings.hector_sweep_on_exit)
+    except Exception:
         return None
 
-    if resp.status_code != 200:
-        return None
+    return extract_chat_content(payload)
 
-    try:
-        data = resp.json()
-        content = data["choices"][0]["message"]["content"]
-        return content if content and content.strip() else None
-    except (KeyError, IndexError, ValueError):
-        return None
+
+async def hector_clean_markdown(raw_markdown: str) -> str | None:
+    """Post-process scraped markdown through Hector without blocking the event loop.
+
+    @param raw_markdown: Raw markdown from crawl4ai or Jina.
+    @returns: Cleaned markdown string, or None if Hector cleanup failed/unavailable.
+    """
+    return await asyncio.to_thread(hector_clean_markdown_sync, raw_markdown)
+
+
+async def llm_clean_markdown(raw_markdown: str) -> str | None:
+    """Post-process scraped markdown through the configured model cleanup provider.
+
+    @param raw_markdown: Raw markdown from crawl4ai or Jina.
+    @returns: Cleaned markdown string, or None if cleanup failed/unavailable.
+    """
+    provider = resolve_cleanup_provider()
+    if provider == "hector":
+        return await hector_clean_markdown(raw_markdown)
+    return None
 
 
 # ── Pipeline orchestration ───────────────────────────────────
 
 
 async def maybe_llm_clean(markdown: str) -> tuple[str, bool]:
-    """Apply gpt-4o-mini cleanup only when the markdown looks noisy.
+    """Apply model-backed cleanup only when the markdown looks noisy.
 
     @param markdown: Raw markdown from crawl4ai or Jina.
     @returns: Tuple of (content, was_llm_cleaned).
     """
-    if looks_noisy(markdown) and settings.openai_api_key:
+    if looks_noisy(markdown) and resolve_cleanup_provider() != "none":
         cleaned = await llm_clean_markdown(markdown)
         if cleaned:
             return cleaned, True
