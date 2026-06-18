@@ -114,6 +114,16 @@ class TestValidateUrl:
             _validate_url("ftp://example.com")
         assert exc_info.value.code == EXIT_INVALID_INPUT
 
+    def test_internal_ip_rejected(self) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            _validate_url("http://127.0.0.1:8020/admin")
+        assert exc_info.value.code == EXIT_INVALID_INPUT
+
+    def test_metadata_endpoint_rejected(self) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            _validate_url("http://169.254.169.254/latest/meta-data/")
+        assert exc_info.value.code == EXIT_INVALID_INPUT
+
 
 # ── stdin parsing ────────────────────────────────────────────
 
@@ -322,7 +332,7 @@ class TestCmdServe:
         cmd_serve(args)
         mock_run.assert_called_once_with(
             "dendrite_scraper.server:app",
-            host="0.0.0.0",
+            host="127.0.0.1",
             port=8020,
             log_level="info",
         )

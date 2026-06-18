@@ -4,11 +4,15 @@ Uses FastAPI's TestClient — no real server needed.
 Scraping calls are mocked to avoid network access.
 """
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 
+import dendrite_scraper.server as server_module
 from dendrite_scraper.scraper import ScrapeResult
+from dendrite_scraper.settings import settings
 
 
 class TestHealthEndpoint:
@@ -121,3 +125,91 @@ class TestScrapeEndpoint:
     def test_missing_url_rejected(self, client: TestClient) -> None:
         resp = client.post("/scrape", json={})
         assert resp.status_code == 422
+
+    def test_internal_ip_rejected_400(self, client: TestClient) -> None:
+        resp = client.post("/scrape", json={"url": "http://127.0.0.1:8020/health"})
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "URL rejected"
+
+    def test_metadata_endpoint_rejected_400(self, client: TestClient) -> None:
+        resp = client.post("/scrape", json={"url": "http://169.254.169.254/latest/meta-data/"})
+        assert resp.status_code == 400
+
+
+class TestServerResourceLimits:
+    """Tests for the global timeout and concurrency cap (M6, M7)."""
+
+    def test_global_timeout_returns_error(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "server_timeout_seconds", 0.05)
+
+        async def _hang(_url: str) -> ScrapeResult:
+            await asyncio.sleep(5)
+            return ScrapeResult()  # pragma: no cover
+
+        with patch("dendrite_scraper.server.scrape", new=_hang):
+            resp = client.post("/scrape", json={"url": "https://example.com"})
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["error"] is not None
+        assert "timeout" in body["error"].lower()
+
+    def test_over_capacity_returns_503(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(server_module, "_scrape_semaphore", asyncio.Semaphore(0))
+        monkeypatch.setattr(settings, "scrape_acquire_timeout_seconds", 0.05)
+
+        resp = client.post("/scrape", json={"url": "https://example.com"})
+        assert resp.status_code == 503
+        assert resp.headers.get("Retry-After") == "5"
+
+
+class TestApiKeyAuth:
+    """Tests for the optional API key (M8)."""
+
+    @patch("dendrite_scraper.server.scrape", new_callable=AsyncMock)
+    def test_open_when_unset(self, mock_scrape: AsyncMock, client: TestClient) -> None:
+        mock_scrape.return_value = ScrapeResult(url="https://example.com", source="crawl4ai")
+        resp = client.post("/scrape", json={"url": "https://example.com"})
+        assert resp.status_code == 200
+
+    def test_missing_key_rejected_when_set(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "api_key", "s3cret")
+        resp = client.post("/scrape", json={"url": "https://example.com"})
+        assert resp.status_code == 401
+
+    def test_wrong_key_rejected(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "api_key", "s3cret")
+        resp = client.post(
+            "/scrape", json={"url": "https://example.com"}, headers={"X-API-Key": "nope"}
+        )
+        assert resp.status_code == 401
+
+    @patch("dendrite_scraper.server.scrape", new_callable=AsyncMock)
+    def test_correct_x_api_key_accepted(
+        self, mock_scrape: AsyncMock, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "api_key", "s3cret")
+        mock_scrape.return_value = ScrapeResult(url="https://example.com", source="crawl4ai")
+        resp = client.post(
+            "/scrape", json={"url": "https://example.com"}, headers={"X-API-Key": "s3cret"}
+        )
+        assert resp.status_code == 200
+
+    @patch("dendrite_scraper.server.scrape", new_callable=AsyncMock)
+    def test_correct_bearer_token_accepted(
+        self, mock_scrape: AsyncMock, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "api_key", "s3cret")
+        mock_scrape.return_value = ScrapeResult(url="https://example.com", source="crawl4ai")
+        resp = client.post(
+            "/scrape",
+            json={"url": "https://example.com"},
+            headers={"Authorization": "Bearer s3cret"},
+        )
+        assert resp.status_code == 200

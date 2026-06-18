@@ -5,17 +5,53 @@ Two endpoints:
   GET  /health  — liveness check
 """
 
+import asyncio
 import logging
+import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, HttpUrl
 
+from dendrite_scraper.safety import UrlRejected, validate_url
 from dendrite_scraper.scraper import ScrapeResult, resolve_cleanup_provider, scrape
 from dendrite_scraper.settings import settings
 
 logger = logging.getLogger(__name__)
+
+# Bounds concurrent in-flight scrapes (each can launch a Chromium); excess
+# requests wait briefly then get 503. Module-level so it is shared across
+# requests; safe to construct outside a running loop on Python 3.10+.
+_scrape_semaphore = asyncio.Semaphore(settings.max_concurrent_scrapes)
+
+
+def require_api_key(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None),
+) -> None:
+    """Enforce the optional API key on protected endpoints.
+
+    When `settings.api_key` is unset the check is a no-op (zero-config local
+    use). When set, require a matching `Authorization: Bearer <key>` or
+    `X-API-Key: <key>` header, compared in constant time.
+
+    @param authorization: Authorization header, if present.
+    @param x_api_key: X-API-Key header, if present.
+    @throws HTTPException: 401 when a key is required but missing/incorrect.
+    """
+    expected = settings.api_key
+    if not expected:
+        return
+
+    presented = x_api_key
+    if presented is None and authorization is not None:
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() == "bearer":
+            presented = token
+
+    if presented is None or not secrets.compare_digest(presented, expected):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
 @asynccontextmanager
@@ -84,14 +120,45 @@ class HealthResponse(BaseModel):
 # ── Endpoints ────────────────────────────────────────────────
 
 
-@app.post("/scrape", response_model=ScrapeResponse)
+@app.post("/scrape", response_model=ScrapeResponse, dependencies=[Depends(require_api_key)])
 async def scrape_endpoint(request: ScrapeRequest) -> ScrapeResponse:
     """Scrape a URL through the full pipeline and return cleaned markdown.
 
+    Rejects blocked URLs up front (400), bounds concurrency (503 when the
+    server is at capacity), and enforces a global per-request deadline.
+
     @param request: Request containing the URL to scrape.
     @returns: Scrape result with cleaned markdown or error details.
+    @throws HTTPException: 400 when blocked by the SSRF guard, 503 when at capacity.
     """
-    result: ScrapeResult = await scrape(str(request.url))
+    url = str(request.url)
+    try:
+        validate_url(url)
+    except UrlRejected as exc:
+        raise HTTPException(status_code=400, detail="URL rejected") from exc
+
+    # Bound concurrency: wait briefly for a slot, else shed load with 503.
+    try:
+        await asyncio.wait_for(
+            _scrape_semaphore.acquire(),
+            timeout=settings.scrape_acquire_timeout_seconds,
+        )
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=503, detail="Server busy", headers={"Retry-After": "5"}
+        ) from exc
+
+    try:
+        result: ScrapeResult = await asyncio.wait_for(
+            scrape(url), timeout=settings.server_timeout_seconds
+        )
+    except TimeoutError:
+        result = ScrapeResult(
+            url=url, error=f"Global timeout exceeded ({settings.server_timeout_seconds}s)"
+        )
+    finally:
+        _scrape_semaphore.release()
+
     return ScrapeResponse(
         markdown=result.markdown,
         source=result.source,

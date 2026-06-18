@@ -7,8 +7,8 @@ no network and no real browser required.
 
 import builtins
 import sys
-from collections.abc import Mapping, Sequence
-from types import ModuleType
+from collections.abc import AsyncIterator, Mapping, Sequence
+from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
@@ -17,6 +17,10 @@ import pytest
 
 import dendrite_scraper.scraper as scraper_module
 from dendrite_scraper.scraper import (
+    _cap_markdown,
+    _guard_route,
+    _is_non_retryable_crawl_error,
+    _suppressed_stdout,
     clean_markdown_content,
     crawl_url,
     find_hector_resident_target,
@@ -106,9 +110,11 @@ class FakeResponse:
         text: str = "",
         json_data: object | None = None,
         json_error: Exception | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         self.status_code = status_code
         self.text = text
+        self.headers = headers or {}
         self._json_data = json_data
         self._json_error = json_error
 
@@ -123,6 +129,53 @@ class FakeResponse:
         return self._json_data
 
 
+class FakeStreamResponse:
+    """Streaming HTTP response stub for httpx.AsyncClient.stream().
+
+    @param status_code: Response status code.
+    @param text: Body text (also the default single chunk and aread() payload).
+    @param headers: Response headers.
+    @param chunks: Explicit byte chunks for aiter_bytes (overrides text).
+    """
+
+    def __init__(
+        self,
+        *,
+        status_code: int = 200,
+        text: str = "",
+        headers: dict[str, str] | None = None,
+        chunks: list[bytes] | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self.text = text
+        self.headers = headers or {}
+        self._chunks = chunks if chunks is not None else [text.encode()]
+
+    async def aiter_bytes(self) -> "AsyncIterator[bytes]":
+        for chunk in self._chunks:
+            yield chunk
+
+    async def aread(self) -> bytes:
+        return self.text.encode()
+
+
+class _FakeStreamCM:
+    """Async context manager returned by FakeAsyncClient.stream()."""
+
+    def __init__(self, response: FakeStreamResponse | None, error: Exception | None) -> None:
+        self._response = response
+        self._error = error
+
+    async def __aenter__(self) -> FakeStreamResponse:
+        if self._error is not None:
+            raise self._error
+        assert self._response is not None
+        return self._response
+
+    async def __aexit__(self, *_args: object) -> bool:
+        return False
+
+
 class FakeAsyncClient:
     """Async httpx.AsyncClient substitute with programmable responses.
 
@@ -130,6 +183,8 @@ class FakeAsyncClient:
     @param post_response: Response returned by post().
     @param get_error: Optional exception raised by get().
     @param post_error: Optional exception raised by post().
+    @param stream_response: Streaming response returned by stream().
+    @param stream_error: Optional exception raised on entering stream().
     """
 
     def __init__(
@@ -139,13 +194,28 @@ class FakeAsyncClient:
         post_response: FakeResponse | None = None,
         get_error: Exception | None = None,
         post_error: Exception | None = None,
+        stream_response: FakeStreamResponse | None = None,
+        stream_error: Exception | None = None,
     ) -> None:
         self.get_response = get_response
         self.post_response = post_response
         self.get_error = get_error
         self.post_error = post_error
+        self.stream_response = stream_response
+        self.stream_error = stream_error
         self.last_get: tuple[tuple[object, ...], dict[str, object]] | None = None
         self.last_post: tuple[tuple[object, ...], dict[str, object]] | None = None
+        self.last_stream: tuple[tuple[object, ...], dict[str, object]] | None = None
+
+    def stream(self, *args: object, **kwargs: object) -> _FakeStreamCM:
+        """Record a stream() call and return a programmable streaming context.
+
+        @param args: Positional request args (method, url).
+        @param kwargs: Keyword request args.
+        @returns: Async context manager yielding the configured stream response.
+        """
+        self.last_stream = (args, kwargs)
+        return _FakeStreamCM(self.stream_response, self.stream_error)
 
     async def __aenter__(self) -> "FakeAsyncClient":
         """Return the fake client for `async with`.
@@ -370,6 +440,40 @@ class TestLooksLikeBotBlock:
         page = "# Welcome\n\nThis is a real page with actual content.\n" * 20
         assert not looks_like_bot_block(page)
 
+    def test_short_legit_page_mentioning_cloudflare_not_flagged(self) -> None:
+        """A short doc page with a heading that merely mentions a provider isn't a challenge."""
+        page = (
+            "# Using Cloudflare\n\n"
+            "Cloudflare is a CDN that fronts your site. This short guide shows how to "
+            "configure caching rules for your project.\n"
+        )
+        assert not looks_like_bot_block(page)
+
+    def test_terse_headingless_challenge_still_flagged(self) -> None:
+        assert looks_like_bot_block("Just a moment...\nPerforming security verification")
+
+
+class TestNonRetryableCrawlError:
+    """Tests for the typed non-retryable crawl-error predicate (replaces substring sniffing)."""
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "crawl4ai is not installed. Run: ...",
+            "Crawl timed out after 25s",
+            "Blocked: blocked-address: loopback",
+        ],
+    )
+    def test_non_retryable(self, message: str) -> None:
+        assert _is_non_retryable_crawl_error(message) is True
+
+    @pytest.mark.parametrize(
+        "message",
+        ["Crawl failed: connection reset", "No markdown content returned", "transient failure"],
+    )
+    def test_retryable(self, message: str) -> None:
+        assert _is_non_retryable_crawl_error(message) is False
+
 
 # ── looks_noisy ──────────────────────────────────────────────
 
@@ -492,19 +596,21 @@ class TestJinaFetch:
 
     @pytest.mark.asyncio
     async def test_success(self) -> None:
-        client = FakeAsyncClient(get_response=FakeResponse(status_code=200, text="# Jina\n"))
+        client = FakeAsyncClient(
+            stream_response=FakeStreamResponse(status_code=200, text="# Jina\n")
+        )
 
         with patch("dendrite_scraper.scraper.httpx.AsyncClient", return_value=client):
             markdown, is_error = await jina_fetch("https://example.com")
 
         assert is_error is False
         assert markdown == "# Jina\n"
-        assert client.last_get is not None
-        assert client.last_get[0][0] == "https://r.jina.ai/https://example.com"
+        assert client.last_stream is not None
+        assert client.last_stream[0] == ("GET", "https://r.jina.ai/https://example.com")
 
     @pytest.mark.asyncio
     async def test_http_error(self) -> None:
-        client = FakeAsyncClient(get_error=httpx.HTTPError("network down"))
+        client = FakeAsyncClient(stream_error=httpx.HTTPError("network down"))
 
         with patch("dendrite_scraper.scraper.httpx.AsyncClient", return_value=client):
             message, is_error = await jina_fetch("https://example.com")
@@ -514,17 +620,20 @@ class TestJinaFetch:
 
     @pytest.mark.asyncio
     async def test_non_200(self) -> None:
-        client = FakeAsyncClient(get_response=FakeResponse(status_code=403, text="forbidden"))
+        client = FakeAsyncClient(
+            stream_response=FakeStreamResponse(status_code=403, text="forbidden")
+        )
 
         with patch("dendrite_scraper.scraper.httpx.AsyncClient", return_value=client):
             message, is_error = await jina_fetch("https://example.com")
 
         assert is_error is True
-        assert message == "Jina Reader error 403: forbidden"
+        assert message == "Jina Reader error 403"
+        assert "forbidden" not in message  # upstream body not reflected (M11)
 
     @pytest.mark.asyncio
     async def test_empty_body(self) -> None:
-        client = FakeAsyncClient(get_response=FakeResponse(status_code=200, text="   "))
+        client = FakeAsyncClient(stream_response=FakeStreamResponse(status_code=200, text="   "))
 
         with patch("dendrite_scraper.scraper.httpx.AsyncClient", return_value=client):
             message, is_error = await jina_fetch("https://example.com")
@@ -549,7 +658,9 @@ class TestHectorCleanMarkdown:
             calls["ensure"] = kwargs
             return target
 
-        def chat(_target: FakeHectorTarget, messages: object, **kwargs: object) -> dict[str, object]:
+        def chat(
+            _target: FakeHectorTarget, messages: object, **kwargs: object
+        ) -> dict[str, object]:
             calls["messages"] = messages
             calls["chat"] = kwargs
             return {"choices": [{"message": {"content": "# Local clean\n"}}]}
@@ -756,7 +867,8 @@ class TestScrape:
         mock_sleep.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_bot_detection_falls_back_to_jina(self) -> None:
+    async def test_bot_detection_falls_back_to_jina(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scraper_module.settings, "jina_enabled", True)
         with (
             patch(
                 "dendrite_scraper.scraper.crawl_url",
@@ -783,6 +895,7 @@ class TestScrape:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(scraper_module.settings, "max_retries", 3)
+        monkeypatch.setattr(scraper_module.settings, "jina_enabled", True)
 
         with (
             patch(
@@ -807,6 +920,7 @@ class TestScrape:
     ) -> None:
         monkeypatch.setattr(scraper_module.settings, "max_retries", 2)
         monkeypatch.setattr(scraper_module.settings, "retry_delay_seconds", 0)
+        monkeypatch.setattr(scraper_module.settings, "jina_enabled", True)
 
         with (
             patch(
@@ -827,7 +941,8 @@ class TestScrape:
         mock_sleep.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_jina_success_can_mark_llm_cleaned(self) -> None:
+    async def test_jina_success_can_mark_llm_cleaned(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scraper_module.settings, "jina_enabled", True)
         noisy = "\n".join(f"[Link {i}](https://example.com/{i})" for i in range(20))
 
         with (
@@ -848,3 +963,185 @@ class TestScrape:
         assert result.source == "jina"
         assert result.llm_cleaned is True
         assert result.markdown == "# Clean\n"
+
+
+# ── SSRF guard integration ───────────────────────────────────
+
+
+class FakeRoute:
+    """Minimal Playwright route stub for route-guard tests."""
+
+    def __init__(self, url: str, *, is_nav: bool = False) -> None:
+        self.request = SimpleNamespace(url=url, is_navigation_request=lambda: is_nav)
+        self.aborted = False
+        self.continued = False
+
+    async def abort(self) -> None:
+        self.aborted = True
+
+    async def continue_(self) -> None:
+        self.continued = True
+
+
+class TestSsrfGuard:
+    """Tests that the SSRF guard is enforced on every fetch path."""
+
+    @pytest.mark.asyncio
+    async def test_scrape_rejects_internal_url_without_fetching(self) -> None:
+        with (
+            patch("dendrite_scraper.scraper.crawl_url", new=AsyncMock()) as mock_crawl,
+            patch("dendrite_scraper.scraper.jina_fetch", new=AsyncMock()) as mock_jina,
+        ):
+            result = await scrape("http://169.254.169.254/latest/meta-data/")
+
+        assert result.source == "none"
+        assert result.markdown == ""
+        assert result.error is not None
+        assert "rejected" in result.error
+        mock_crawl.assert_not_called()
+        mock_jina.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_crawl_url_blocks_internal_before_browser(self) -> None:
+        # No crawl4ai module patched in — a blocked URL must return before import/launch.
+        message, is_error = await crawl_url("http://127.0.0.1:8020/admin")
+        assert is_error is True
+        assert message.startswith("Blocked:")
+
+    @pytest.mark.asyncio
+    async def test_jina_disabled_by_default(self) -> None:
+        with (
+            patch(
+                "dendrite_scraper.scraper.crawl_url",
+                new=AsyncMock(return_value=("Just a moment", False)),
+            ),
+            patch("dendrite_scraper.scraper.jina_fetch", new=AsyncMock()) as mock_jina,
+        ):
+            result = await scrape("https://protected.example.com")
+
+        assert result.source == "none"
+        assert "jina disabled" in result.attempts
+        mock_jina.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_jina_strips_credentials_before_egress(self) -> None:
+        client = FakeAsyncClient(
+            stream_response=FakeStreamResponse(status_code=200, text="# Jina\n")
+        )
+
+        with patch("dendrite_scraper.scraper.httpx.AsyncClient", return_value=client):
+            markdown, is_error = await jina_fetch("https://user:pass@example.com/x")
+
+        assert is_error is False
+        assert client.last_stream is not None
+        sent_url = cast(str, client.last_stream[0][1])
+        assert sent_url == "https://r.jina.ai/https://example.com/x"
+        assert "user" not in sent_url and "pass" not in sent_url
+
+    @pytest.mark.asyncio
+    async def test_jina_blocks_internal_target(self) -> None:
+        message, is_error = await jina_fetch("http://10.0.0.5/secret")
+        assert is_error is True
+        assert "blocked" in message.lower()
+
+    @pytest.mark.asyncio
+    async def test_route_guard_aborts_internal_request(self) -> None:
+        route = FakeRoute("http://169.254.169.254/latest/meta-data/")
+        await _guard_route(route)
+        assert route.aborted is True
+        assert route.continued is False
+
+    @pytest.mark.asyncio
+    async def test_route_guard_allows_public_request(self) -> None:
+        route = FakeRoute("https://example.com/page")
+        await _guard_route(route)
+        assert route.continued is True
+        assert route.aborted is False
+
+
+# ── Resource bounding (M9, M10) ──────────────────────────────
+
+
+class TestResourceBounding:
+    """Tests for size caps and concurrency-safe stdout suppression."""
+
+    def test_cap_markdown_truncates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scraper_module.settings, "max_markdown_chars", 10)
+        assert _cap_markdown("x" * 100) == "x" * 10
+
+    def test_cap_markdown_keeps_small(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scraper_module.settings, "max_markdown_chars", 10)
+        assert _cap_markdown("short") == "short"
+
+    @pytest.mark.asyncio
+    async def test_crawl_caps_markdown(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scraper_module.settings, "max_markdown_chars", 10)
+        crawler = FakeCrawler(result=FakeCrawlResult(success=True, markdown="y" * 100))
+
+        with patch.dict(sys.modules, {"crawl4ai": build_fake_crawl4ai(crawler)}):
+            markdown, is_error = await crawl_url("https://example.com")
+
+        assert is_error is False
+        assert markdown == "y" * 10
+
+    @pytest.mark.asyncio
+    async def test_jina_rejects_oversized_by_content_length(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(scraper_module.settings, "jina_max_bytes", 1000)
+        client = FakeAsyncClient(
+            stream_response=FakeStreamResponse(
+                status_code=200, text="ok", headers={"content-length": "9999999"}
+            )
+        )
+        with patch("dendrite_scraper.scraper.httpx.AsyncClient", return_value=client):
+            message, is_error = await jina_fetch("https://example.com")
+
+        assert is_error is True
+        assert "too large" in message
+
+    @pytest.mark.asyncio
+    async def test_jina_aborts_oversized_stream_without_content_length(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # No Content-Length header: the byte cap must trip mid-stream (DF-2).
+        monkeypatch.setattr(scraper_module.settings, "jina_max_bytes", 10)
+        client = FakeAsyncClient(
+            stream_response=FakeStreamResponse(
+                status_code=200, chunks=[b"x" * 8, b"x" * 8, b"x" * 8]
+            )
+        )
+        with patch("dendrite_scraper.scraper.httpx.AsyncClient", return_value=client):
+            message, is_error = await jina_fetch("https://example.com")
+
+        assert is_error is True
+        assert "too large" in message
+
+    @pytest.mark.asyncio
+    async def test_route_guard_aborts_after_max_redirects(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from dendrite_scraper.scraper import _make_route_guard
+
+        monkeypatch.setattr(scraper_module.settings, "max_redirects", 2)
+        guard = _make_route_guard()
+        # Allowed: 1 initial navigation + 2 redirect hops = 3; the 4th aborts.
+        nav_routes = [FakeRoute("https://example.com/", is_nav=True) for _ in range(4)]
+        for route in nav_routes[:3]:
+            await guard(route)
+        await guard(nav_routes[3])
+
+        assert all(r.continued for r in nav_routes[:3])
+        assert nav_routes[3].aborted is True
+        assert nav_routes[3].continued is False
+
+    def test_suppressed_stdout_nested_restores(self) -> None:
+        """Nested (concurrent-style) suppression must only restore at the outermost exit."""
+        original = sys.stdout
+        with _suppressed_stdout():
+            assert sys.stdout is not original
+            with _suppressed_stdout():
+                assert sys.stdout is not original
+            # Inner exit must NOT restore while an outer scope is still active.
+            assert sys.stdout is not original
+        assert sys.stdout is original

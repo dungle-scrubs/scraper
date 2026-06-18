@@ -127,7 +127,11 @@ docker compose up -d
 | `DENDRITE_HECTOR_PROVIDER` | No | Hector provider for local cleanup (default: `mlx`) |
 | `DENDRITE_HECTOR_MODEL` | No | Hector model for local cleanup (default: `mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit`) |
 | `DENDRITE_PORT` | No | Server port (default: 8020) |
-| `DENDRITE_HOST` | No | Bind address (default: 0.0.0.0) |
+| `DENDRITE_HOST` | No | Bind address (default: `127.0.0.1`, local only; set `0.0.0.0` to expose) |
+| `DENDRITE_API_KEY` | No | When set, `POST /scrape` requires a matching `Authorization: Bearer` or `X-API-Key` header |
+| `DENDRITE_JINA_ENABLED` | No | Enable the third-party Jina Reader fallback (default: `false`) |
+| `DENDRITE_SERVER_TIMEOUT_SECONDS` | No | Global per-request deadline for `/scrape` (default: 120) |
+| `DENDRITE_MAX_CONCURRENT_SCRAPES` | No | Max concurrent scrapes before `503` (default: 4) |
 | `DENDRITE_CRAWL_TIMEOUT_SECONDS` | No | Crawl4AI timeout (default: 25) |
 
 `auto` uses Hector when `DENDRITE_HECTOR_PROVIDER` and
@@ -137,6 +141,31 @@ docker compose up -d
 Hector cleanup requires the Hector Python client to be importable by the
 service, for example by installing `~/dev/hector/clients/hector-py` into the
 same environment.
+
+## Security
+
+This service fetches **arbitrary, caller-supplied URLs** and treats every
+inbound URL and every fetched page as untrusted. Defaults are tuned for a
+**local, single-user** tool:
+
+- **SSRF guard.** Every URL — on the crawl4ai path, the Jina path, the CLI, and
+  every redirect hop — is validated by a single guard that allows only
+  `http(s)` and rejects hosts resolving to loopback, private, link-local,
+  reserved, multicast, CGNAT, or cloud-metadata addresses (e.g.
+  `127.0.0.1`, `169.254.169.254`, `10.0.0.0/8`). Credentials in
+  `user:pass@host` URLs are stripped before any request.
+- **Local by default.** The server binds `127.0.0.1`. Set `DENDRITE_HOST=0.0.0.0`
+  to expose it — and set `DENDRITE_API_KEY` when you do.
+- **Optional auth.** With `DENDRITE_API_KEY` set, `POST /scrape` requires a
+  matching `Authorization: Bearer <key>` or `X-API-Key: <key>` header.
+- **Resource bounds.** A global per-request deadline, a concurrency cap
+  (`503` when exceeded), and response/markdown size caps protect against
+  hangs and memory exhaustion.
+- **Third-party egress is opt-in.** The Jina Reader fallback is disabled by
+  default (`DENDRITE_JINA_ENABLED=false`) because it sends the target URL to a
+  third party (`r.jina.ai`).
+
+Report vulnerabilities privately — see [SECURITY.md](SECURITY.md).
 
 ## Use as a library
 

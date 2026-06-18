@@ -14,10 +14,12 @@ Pipeline:
 """
 
 import asyncio
+import contextlib
 import logging
 import re
 import sys
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from importlib import import_module
 from types import SimpleNamespace
@@ -25,6 +27,7 @@ from typing import Any, Literal, cast
 
 import httpx
 
+from dendrite_scraper.safety import UrlRejected, validate_url
 from dendrite_scraper.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -32,6 +35,14 @@ logger = logging.getLogger(__name__)
 # ── Constants ────────────────────────────────────────────────
 
 JINA_READER_PREFIX = "https://r.jina.ai/"
+
+# Crawl errors that should not be retried (vs. transient failures). Matched by
+# prefix against crawl_url's own messages — not arbitrary page content.
+NON_RETRYABLE_CRAWL_PREFIXES = (
+    "crawl4ai is not installed",
+    "Crawl timed out",
+    "Blocked:",
+)
 
 BOT_DETECTION_PHRASES = (
     "performing security verification",
@@ -94,6 +105,54 @@ class ScrapeResult:
     attempts: list[str] = field(default_factory=list)
 
 
+# ── Resource bounding ────────────────────────────────────────
+
+# Depth-counted so concurrent crawls in one event loop don't corrupt sys.stdout:
+# only the outermost entry saves/restores the real stream (a naive save/restore
+# per call would capture another in-flight call's already-swapped stream).
+_stdout_suppress_depth = 0
+_stdout_real: Any = None
+
+
+@contextlib.contextmanager
+def _suppressed_stdout() -> Iterator[None]:
+    """Silence direct stdout writes (crawl4ai progress bars) — concurrency-safe.
+
+    @returns: Context manager that routes stdout to stderr for its duration.
+    """
+    global _stdout_suppress_depth, _stdout_real
+    if _stdout_suppress_depth == 0:
+        _stdout_real = sys.stdout
+        sys.stdout = sys.stderr
+    _stdout_suppress_depth += 1
+    try:
+        yield
+    finally:
+        _stdout_suppress_depth -= 1
+        if _stdout_suppress_depth == 0:
+            sys.stdout = _stdout_real
+            _stdout_real = None
+
+
+def _is_non_retryable_crawl_error(message: str) -> bool:
+    """Return True for crawl errors that retrying cannot fix.
+
+    @param message: Error message returned by `crawl_url`.
+    @returns: True when the crawl should not be retried.
+    """
+    return message.startswith(NON_RETRYABLE_CRAWL_PREFIXES)
+
+
+def _cap_markdown(markdown: str) -> str:
+    """Bound markdown length before it reaches the heuristics and cleaners.
+
+    @param markdown: Raw markdown from any source.
+    @returns: Markdown truncated to `settings.max_markdown_chars`.
+    """
+    cap = settings.max_markdown_chars
+    return markdown if len(markdown) <= cap else markdown[:cap]
+
+
 # ── Artifact stripping ───────────────────────────────────────
 
 
@@ -153,8 +212,13 @@ def looks_like_bot_block(markdown: str) -> bool:
     """
     lower = markdown.lower()
 
-    # Short pages with bot-protection phrases → challenge page.
-    if len(markdown) < 2000 and any(phrase in lower for phrase in BOT_DETECTION_PHRASES):
+    # Challenge pages are short, heading-less, and terse. Requiring all three
+    # avoids false positives on legitimate short docs that merely mention a
+    # provider name like "cloudflare".
+    has_phrase = any(phrase in lower for phrase in BOT_DETECTION_PHRASES)
+    has_heading = any(line.lstrip().startswith("#") for line in markdown.splitlines())
+    word_count = len(lower.split())
+    if has_phrase and not has_heading and len(markdown) < 1500 and word_count < 150:
         return True
 
     # Partial JS rendering: rows with many empty cells between pipes.
@@ -170,6 +234,65 @@ def looks_like_bot_block(markdown: str) -> bool:
 # ── Crawl4AI ─────────────────────────────────────────────────
 
 
+async def _guard_route(route: Any) -> None:
+    """Playwright route handler: abort any in-browser request to a blocked host.
+
+    Fires on every request the page makes, including redirect hops, so a public
+    URL that 3xx-redirects toward an internal/metadata host is aborted rather
+    than followed.
+
+    @param route: Playwright route for the intercepted request.
+    """
+    try:
+        validate_url(route.request.url)
+    except UrlRejected:
+        await route.abort()
+        return
+    await route.continue_()
+
+
+def _make_route_guard() -> Any:
+    """Build a per-page route handler that host-validates and caps redirect hops.
+
+    Each page context gets a fresh handler with its own navigation counter so a
+    redirect loop to public hosts can't spin forever (DoS), on top of the per-hop
+    host validation that closes SSRF.
+
+    @returns: An async Playwright route handler.
+    """
+    nav_count = 0
+
+    async def guard(route: Any) -> None:
+        nonlocal nav_count
+        is_nav = getattr(route.request, "is_navigation_request", None)
+        if callable(is_nav) and is_nav():
+            nav_count += 1
+            # Allow the initial navigation plus `max_redirects` hops.
+            if nav_count > settings.max_redirects + 1:
+                await route.abort()
+                return
+        await _guard_route(route)
+
+    return guard
+
+
+async def _install_route_guard(*args: Any, **kwargs: Any) -> Any:
+    """crawl4ai `on_page_context_created` hook: attach the route guard to the page.
+
+    Locates the Playwright page among the hook arguments (signatures vary across
+    crawl4ai versions) and installs a fresh counting route guard on all requests.
+
+    @param args: Positional hook arguments.
+    @param kwargs: Keyword hook arguments.
+    @returns: The page object, when found (crawl4ai expects the page back).
+    """
+    candidates = [*args, *kwargs.values()]
+    page = next((c for c in candidates if hasattr(c, "route") and hasattr(c, "goto")), None)
+    if page is not None:
+        await page.route("**/*", _make_route_guard())
+    return page
+
+
 async def crawl_url(url: str) -> tuple[str, bool]:
     """Crawl a single URL with Crawl4AI and return (markdown, is_error).
 
@@ -179,6 +302,12 @@ async def crawl_url(url: str) -> tuple[str, bool]:
     @param url: URL to scrape.
     @returns: Tuple of (content_or_error_message, is_error).
     """
+    # Pre-flight SSRF guard: reject before launching a browser at all.
+    try:
+        validate_url(url)
+    except UrlRejected as exc:
+        return f"Blocked: {exc.reason}", True
+
     try:
         from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
     except ImportError:
@@ -198,20 +327,23 @@ async def crawl_url(url: str) -> tuple[str, bool]:
         delay_before_return_html=2.0,
     )
 
-    # Redirect stdout during crawl — crawl4ai writes progress bars directly.
-    original_stdout = sys.stdout
-    sys.stdout = sys.stderr
-
+    # Suppress crawl4ai's direct stdout writes (progress bars) for the crawl's
+    # duration without corrupting stdout across concurrent requests.
     try:
-        async with AsyncWebCrawler(config=browser_config) as crawler:
-            result = await asyncio.wait_for(
-                crawler.arun(url=url, config=run_config),
-                timeout=settings.crawl_timeout_seconds,
-            )
+        with _suppressed_stdout():
+            async with AsyncWebCrawler(config=browser_config) as crawler:
+                # Re-validate every in-browser request/redirect hop (defeats
+                # redirect bypass; covers what the initial pre-flight cannot).
+                strategy = getattr(crawler, "crawler_strategy", None)
+                if strategy is not None and hasattr(strategy, "set_hook"):
+                    strategy.set_hook("on_page_context_created", _install_route_guard)
+
+                result = await asyncio.wait_for(
+                    crawler.arun(url=url, config=run_config),
+                    timeout=settings.crawl_timeout_seconds,
+                )
     except TimeoutError:
         return f"Crawl timed out after {settings.crawl_timeout_seconds}s", True
-    finally:
-        sys.stdout = original_stdout
 
     if not result.success:
         return f"Crawl failed: {result.error_message}", True
@@ -220,7 +352,7 @@ async def crawl_url(url: str) -> tuple[str, bool]:
     if not markdown.strip():
         return "No markdown content returned", True
 
-    return markdown, False
+    return _cap_markdown(markdown), False
 
 
 # ── Jina Reader fallback ─────────────────────────────────────
@@ -235,25 +367,54 @@ async def jina_fetch(url: str) -> tuple[str, bool]:
     @param url: URL to fetch.
     @returns: Tuple of (content_or_error_message, is_error).
     """
+    # Validate the target and strip any userinfo before it leaves to the third party.
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                f"{JINA_READER_PREFIX}{url}",
+        target = validate_url(url)
+    except UrlRejected as exc:
+        return f"Jina target blocked: {exc.reason}", True
+
+    cap = settings.jina_max_bytes
+    try:
+        async with (
+            httpx.AsyncClient() as client,
+            client.stream(
+                "GET",
+                f"{JINA_READER_PREFIX}{target.url}",
                 headers={"Accept": "text/markdown"},
                 timeout=settings.jina_timeout_seconds,
-                follow_redirects=True,
-            )
-    except (httpx.HTTPError, Exception) as e:
+                follow_redirects=False,
+            ) as resp,
+        ):
+            # Fast reject by declared length before reading any body.
+            declared = resp.headers.get("content-length")
+            if declared is not None and declared.isdigit() and int(declared) > cap:
+                return f"Jina Reader response too large ({declared} bytes)", True
+
+            if resp.status_code != 200:
+                # Log upstream detail; do not reflect the body to the caller.
+                body = await resp.aread()
+                logger.warning(
+                    "Jina Reader %d for %s: %s", resp.status_code, target.host, body[:200]
+                )
+                return f"Jina Reader error {resp.status_code}", True
+
+            # Stream the body, aborting once it exceeds the byte cap (handles
+            # chunked responses with no declared Content-Length).
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in resp.aiter_bytes():
+                total += len(chunk)
+                if total > cap:
+                    return f"Jina Reader response too large (>{cap} bytes)", True
+                chunks.append(chunk)
+    except httpx.HTTPError as e:
         return f"Jina Reader failed: {e}", True
 
-    if resp.status_code != 200:
-        return f"Jina Reader error {resp.status_code}: {resp.text[:200]}", True
-
-    markdown = resp.text
+    markdown = b"".join(chunks).decode("utf-8", errors="replace")
     if not markdown.strip():
         return "Jina Reader returned empty content", True
 
-    return markdown, False
+    return _cap_markdown(markdown), False
 
 
 # ── Model cleanup ────────────────────────────────────────────
@@ -460,6 +621,15 @@ async def scrape(url: str) -> ScrapeResult:
     start = time.monotonic()
     result = ScrapeResult(url=url)
 
+    # ── Step 0: SSRF guard — reject internal/special targets up front ──
+    try:
+        validate_url(url)
+    except UrlRejected as exc:
+        result.error = f"URL rejected: {exc.reason}"
+        result.attempts.append(f"blocked: {exc.reason}")
+        result.elapsed_ms = (time.monotonic() - start) * 1000
+        return result
+
     # ── Step 1: Crawl4AI with retries ────────────────────────
     crawl_error: str | None = None
     for attempt in range(settings.max_retries):
@@ -474,8 +644,8 @@ async def scrape(url: str) -> ScrapeResult:
 
         if err:
             crawl_error = markdown
-            # Don't retry non-transient errors.
-            if "not installed" in markdown or "timed out" in markdown:
+            # Don't retry non-transient errors (missing dep, timeout, blocked URL).
+            if _is_non_retryable_crawl_error(markdown):
                 break
             if attempt < settings.max_retries - 1:
                 await asyncio.sleep(settings.retry_delay_seconds)
@@ -498,7 +668,13 @@ async def scrape(url: str) -> ScrapeResult:
         result.elapsed_ms = (time.monotonic() - start) * 1000
         return result
 
-    # ── Step 2: Jina Reader fallback ─────────────────────────
+    # ── Step 2: Jina Reader fallback (opt-in third-party egress) ──
+    if not settings.jina_enabled:
+        result.attempts.append("jina disabled")
+        result.error = crawl_error
+        result.elapsed_ms = (time.monotonic() - start) * 1000
+        return result
+
     result.attempts.append("jina fallback")
     jina_md, jina_err = await jina_fetch(url)
     if not jina_err:

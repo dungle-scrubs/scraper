@@ -16,13 +16,22 @@ jobs:
   publish:
     name: pypi / publish
     runs-on: ubuntu-latest
+    # Protected environment: configure required reviewers / tag restrictions in
+    # the GitHub repo settings for defense-in-depth on PyPI publishing.
+    environment: pypi
     permissions:
       contents: read
       id-token: write
     steps:
+      # Pin third-party actions by commit SHA in production (Dependabot updates them).
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Test before publishing
+        run: uv run pytest tests/ -q
 
       - uses: actions/setup-python@v5
         with:

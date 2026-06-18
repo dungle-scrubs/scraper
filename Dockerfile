@@ -1,4 +1,5 @@
-FROM python:3.13-slim
+# Pin to a specific minor tag; for production pin by digest (FROM python@sha256:...).
+FROM python:3.13-slim-bookworm
 
 # Playwright system deps for crawl4ai's headless Chromium.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -8,23 +9,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcairo2 libasound2 libwayland-client0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv.
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+# Install uv (pin by version; for production pin by digest).
+COPY --from=ghcr.io/astral-sh/uv:0.9.4 /uv /usr/local/bin/uv
 
+# Run as an unprivileged user — Chromium must not run as root.
+RUN useradd --create-home --uid 10001 appuser
 WORKDIR /app
+RUN chown appuser:appuser /app
+USER appuser
 
 # Install dependencies first (layer caching).
-COPY pyproject.toml uv.lock ./
+COPY --chown=appuser:appuser pyproject.toml uv.lock ./
 RUN uv sync --no-dev --frozen
 
 # Copy source.
-COPY src/ src/
+COPY --chown=appuser:appuser src/ src/
 
 # Install the package.
 RUN uv sync --no-dev --frozen
 
-# Install Playwright browsers for crawl4ai.
-RUN uv run crawl4ai-setup 2>/dev/null || uv run python -m playwright install chromium 2>/dev/null || true
+# Install Playwright browsers for crawl4ai. Fail the build if this fails
+# (do not mask a broken image behind `|| true`).
+RUN uv run crawl4ai-setup || uv run python -m playwright install chromium
 
 EXPOSE 8020
 

@@ -4,6 +4,9 @@ services:
     ports:
       - "8020:8020"
     environment:
+      # Bind all interfaces *inside the container* so the published port works;
+      # the published port is still controlled by the `ports:` mapping below.
+      - DENDRITE_HOST=0.0.0.0
       - DENDRITE_PORT=8020
       - DENDRITE_CLEANUP_PROVIDER=${DENDRITE_CLEANUP_PROVIDER:-none}
     restart: unless-stopped

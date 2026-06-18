@@ -19,3 +19,6 @@ dist/
 
 # Logs
 *.log
+
+# Heap/profiling dumps (can contain in-memory secrets — never commit)
+*.heapsnapshot

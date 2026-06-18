@@ -21,6 +21,7 @@ import logging
 import sys
 from dataclasses import asdict
 
+from dendrite_scraper.safety import UrlRejected, validate_url
 from dendrite_scraper.scraper import ScrapeResult, scrape
 
 # ── Exit codes ───────────────────────────────────────────────
@@ -86,14 +87,19 @@ def _read_url_from_stdin() -> str:
 
 
 def _validate_url(url: str) -> None:
-    """Guard: reject URLs without an HTTP(S) scheme.
+    """Guard: reject non-HTTP(S) schemes and internal/blocked SSRF targets.
+
+    Delegates to the shared `safety.validate_url` guard so the CLI and server
+    enforce identical policy.
 
     @param url: URL candidate to validate.
-    @throws: SystemExit with EXIT_INVALID_INPUT on bad URL.
+    @throws: SystemExit with EXIT_INVALID_INPUT on a bad or blocked URL.
     """
-    if not url.startswith(("http://", "https://")):
-        print(_error_json(f"Invalid URL (must start with http:// or https://): {url}", url=url))
-        raise SystemExit(EXIT_INVALID_INPUT)
+    try:
+        validate_url(url)
+    except UrlRejected as exc:
+        print(_error_json(f"Invalid or blocked URL ({exc.reason}): {url}", url=url))
+        raise SystemExit(EXIT_INVALID_INPUT) from exc
 
 
 # ── Scrape runner ────────────────────────────────────────────
