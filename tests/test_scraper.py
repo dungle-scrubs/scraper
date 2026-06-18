@@ -23,8 +23,7 @@ from dendrite_scraper.scraper import (
     _suppressed_stdout,
     clean_markdown_content,
     crawl_url,
-    find_hector_resident_target,
-    hector_clean_markdown,
+    emberlm_clean_markdown,
     is_scrape_artifact_line,
     jina_fetch,
     llm_clean_markdown,
@@ -261,20 +260,47 @@ class FakeAsyncClient:
         return self.post_response
 
 
-class FakeHectorTarget:
-    """Minimal Hector target stub with release tracking."""
+class FakeEmberlmClient:
+    """httpx.AsyncClient stub for EmberLM: routes /v1/warm vs /chat/completions.
 
-    def __init__(self) -> None:
-        self.released = False
-        self.release_sweep: bool | None = None
+    @param warm_response: Response for the warm POST.
+    @param chat_response: Response for the chat-completions POST.
+    @param warm_error: Optional exception raised on the warm POST.
+    """
 
-    def release(self, *, sweep: bool = False) -> None:
-        """Record release calls made by the Hector cleanup path.
+    def __init__(
+        self,
+        *,
+        warm_response: FakeResponse | None = None,
+        chat_response: FakeResponse | None = None,
+        warm_error: Exception | None = None,
+    ) -> None:
+        self.warm_response = warm_response
+        self.chat_response = chat_response
+        self.warm_error = warm_error
+        self.calls: list[tuple[str, dict[str, object]]] = []
 
-        @param sweep: Whether cleanup requested a Hector sweep.
+    async def __aenter__(self) -> "FakeEmberlmClient":
+        return self
+
+    async def __aexit__(self, *_args: object) -> bool:
+        return False
+
+    async def post(self, url: str, **kwargs: object) -> FakeResponse:
+        """Route by URL: /v1/warm → warm response, else chat response.
+
+        @param url: Request URL.
+        @param kwargs: Request kwargs (json, headers, timeout).
+        @returns: The configured fake response.
         """
-        self.released = True
-        self.release_sweep = sweep
+        self.calls.append((url, kwargs))
+        if "/v1/warm" in url:
+            if self.warm_error is not None:
+                raise self.warm_error
+            assert self.warm_response is not None
+            return self.warm_response
+        assert self.chat_response is not None
+        return self.chat_response
 
 
 # ── Helper builders ──────────────────────────────────────────
@@ -642,116 +668,122 @@ class TestJinaFetch:
         assert message == "Jina Reader returned empty content"
 
 
-# ── llm_clean_markdown ───────────────────────────────────────
+# ── emberlm_clean_markdown ───────────────────────────────────
 
 
-class TestHectorCleanMarkdown:
-    """Tests for the Hector cleanup call."""
+def _warm_ok() -> FakeResponse:
+    return FakeResponse(
+        status_code=200,
+        json_data={"baseUrl": "http://127.0.0.1:17412/v1", "qualifiedId": "mlx/local-model"},
+    )
+
+
+class TestEmberlmCleanMarkdown:
+    """Tests for the EmberLM cleanup call (warm → OpenAI-compatible chat)."""
 
     @pytest.mark.asyncio
-    async def test_success_releases_lease(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        target = FakeHectorTarget()
-        calls: dict[str, object] = {}
-        fake_hector = ModuleType("hector")
-
-        def ensure(**kwargs: object) -> FakeHectorTarget:
-            calls["ensure"] = kwargs
-            return target
-
-        def chat(
-            _target: FakeHectorTarget, messages: object, **kwargs: object
-        ) -> dict[str, object]:
-            calls["messages"] = messages
-            calls["chat"] = kwargs
-            return {"choices": [{"message": {"content": "# Local clean\n"}}]}
-
-        fake_hector.__dict__["ensure"] = ensure
-        fake_hector.__dict__["chat"] = chat
-        monkeypatch.setitem(sys.modules, "hector", fake_hector)
-        monkeypatch.setattr(scraper_module.settings, "hector_provider", "mlx")
-        monkeypatch.setattr(scraper_module.settings, "hector_model", "local-model")
+    async def test_success_warms_then_chats(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scraper_module.settings, "emberlm_provider", "mlx")
+        monkeypatch.setattr(scraper_module.settings, "emberlm_model", "local-model")
         monkeypatch.setattr(scraper_module.settings, "llm_clean_max_input_chars", 5)
+        client = FakeEmberlmClient(
+            warm_response=_warm_ok(),
+            chat_response=FakeResponse(
+                status_code=200,
+                json_data={"choices": [{"message": {"content": "# Local clean\n"}}]},
+            ),
+        )
 
-        cleaned = await hector_clean_markdown("123456789")
+        with patch("dendrite_scraper.scraper.httpx.AsyncClient", return_value=client):
+            cleaned = await emberlm_clean_markdown("123456789")
 
         assert cleaned == "# Local clean\n"
-        assert target.released is True
-        assert calls["ensure"] == {
+        warm_call = next(c for c in client.calls if "/v1/warm" in c[0])
+        assert warm_call[0] == "http://127.0.0.1:17412/v1/warm"
+        assert warm_call[1]["json"] == {
             "provider": "mlx",
             "model": "local-model",
-            "app_name": "dendrite-scraper",
-            "sweep_on_exit": False,
-            "timeout": 180.0,
+            "appName": "dendrite-scraper",
         }
-        messages = cast(list[dict[str, str]], calls["messages"])
-        assert messages[1]["content"] == "12345"
+        chat_call = next(c for c in client.calls if "/chat/completions" in c[0])
+        assert chat_call[0] == "http://127.0.0.1:17412/v1/chat/completions"
+        chat_body = cast(dict[str, Any], chat_call[1]["json"])
+        assert chat_body["model"] == "mlx/local-model"
+        assert chat_body["messages"][1]["content"] == "12345"  # truncated to 5 chars
+        assert cast(dict[str, str], chat_call[1]["headers"]) == {
+            "X-EmberLM-App": "dendrite-scraper"
+        }
 
     @pytest.mark.asyncio
-    async def test_missing_sdk_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delitem(sys.modules, "hector", raising=False)
-        monkeypatch.setattr(scraper_module.settings, "hector_provider", "mlx")
-        monkeypatch.setattr(scraper_module.settings, "hector_model", "local-model")
+    async def test_unconfigured_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scraper_module.settings, "emberlm_provider", None)
+        monkeypatch.setattr(scraper_module.settings, "emberlm_model", None)
 
-        assert await hector_clean_markdown("# Hello\n") is None
+        assert await emberlm_clean_markdown("# Hello\n") is None
 
-    def test_resident_target_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        fake_hector = ModuleType("hector")
+    @pytest.mark.asyncio
+    async def test_warm_failure_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scraper_module.settings, "emberlm_provider", "mlx")
+        monkeypatch.setattr(scraper_module.settings, "emberlm_model", "local-model")
+        client = FakeEmberlmClient(warm_response=FakeResponse(status_code=503, json_data={}))
 
-        def info(**_kwargs: object) -> dict[str, object]:
-            return {
-                "residentModels": [
-                    {
-                        "baseUrl": "http://127.0.0.1:18086/v1",
-                        "model": "local-model",
-                        "provider": "mlx",
-                    }
-                ]
-            }
+        with patch("dendrite_scraper.scraper.httpx.AsyncClient", return_value=client):
+            assert await emberlm_clean_markdown("# Hi\n") is None
 
-        fake_hector.__dict__["info"] = info
-        monkeypatch.setattr(scraper_module.settings, "hector_provider", "mlx")
-        monkeypatch.setattr(scraper_module.settings, "hector_model", "local-model")
+    @pytest.mark.asyncio
+    async def test_warm_unreachable_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scraper_module.settings, "emberlm_provider", "mlx")
+        monkeypatch.setattr(scraper_module.settings, "emberlm_model", "local-model")
+        client = FakeEmberlmClient(warm_error=httpx.HTTPError("connection refused"))
 
-        target = find_hector_resident_target(fake_hector)
+        with patch("dendrite_scraper.scraper.httpx.AsyncClient", return_value=client):
+            assert await emberlm_clean_markdown("# Hi\n") is None
 
-        assert target is not None
-        target_attrs = cast(Any, target)
-        assert target_attrs.base_url == "http://127.0.0.1:18086/v1"
-        assert target_attrs.model == "local-model"
+    @pytest.mark.asyncio
+    async def test_chat_failure_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scraper_module.settings, "emberlm_provider", "mlx")
+        monkeypatch.setattr(scraper_module.settings, "emberlm_model", "local-model")
+        client = FakeEmberlmClient(
+            warm_response=_warm_ok(),
+            chat_response=FakeResponse(status_code=500, json_data={}),
+        )
+
+        with patch("dendrite_scraper.scraper.httpx.AsyncClient", return_value=client):
+            assert await emberlm_clean_markdown("# Hi\n") is None
 
 
 class TestCleanupProvider:
     """Tests for cleanup provider selection."""
 
-    def test_auto_prefers_hector_when_configured(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_auto_prefers_emberlm_when_configured(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(scraper_module.settings, "cleanup_provider", "auto")
-        monkeypatch.setattr(scraper_module.settings, "hector_provider", "mlx")
-        monkeypatch.setattr(scraper_module.settings, "hector_model", "local-model")
+        monkeypatch.setattr(scraper_module.settings, "emberlm_provider", "mlx")
+        monkeypatch.setattr(scraper_module.settings, "emberlm_model", "local-model")
 
-        assert resolve_cleanup_provider() == "hector"
+        assert resolve_cleanup_provider() == "emberlm"
 
-    def test_auto_without_hector_disables_cleanup(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_auto_without_emberlm_disables_cleanup(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(scraper_module.settings, "cleanup_provider", "auto")
-        monkeypatch.setattr(scraper_module.settings, "hector_provider", None)
-        monkeypatch.setattr(scraper_module.settings, "hector_model", None)
+        monkeypatch.setattr(scraper_module.settings, "emberlm_provider", None)
+        monkeypatch.setattr(scraper_module.settings, "emberlm_model", None)
 
         assert resolve_cleanup_provider() == "none"
 
     def test_none_disables_cleanup(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(scraper_module.settings, "cleanup_provider", "none")
-        monkeypatch.setattr(scraper_module.settings, "hector_provider", "mlx")
-        monkeypatch.setattr(scraper_module.settings, "hector_model", "local-model")
+        monkeypatch.setattr(scraper_module.settings, "emberlm_provider", "mlx")
+        monkeypatch.setattr(scraper_module.settings, "emberlm_model", "local-model")
 
         assert resolve_cleanup_provider() == "none"
 
     @pytest.mark.asyncio
-    async def test_llm_clean_dispatches_to_hector(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(scraper_module.settings, "cleanup_provider", "hector")
-        monkeypatch.setattr(scraper_module.settings, "hector_provider", "mlx")
-        monkeypatch.setattr(scraper_module.settings, "hector_model", "local-model")
+    async def test_llm_clean_dispatches_to_emberlm(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scraper_module.settings, "cleanup_provider", "emberlm")
+        monkeypatch.setattr(scraper_module.settings, "emberlm_provider", "mlx")
+        monkeypatch.setattr(scraper_module.settings, "emberlm_model", "local-model")
 
         with patch(
-            "dendrite_scraper.scraper.hector_clean_markdown",
+            "dendrite_scraper.scraper.emberlm_clean_markdown",
             new=AsyncMock(return_value="# Local\n"),
         ):
             assert await llm_clean_markdown("# Raw\n") == "# Local\n"
@@ -765,9 +797,9 @@ class TestMaybeLlmClean:
 
     @pytest.mark.asyncio
     async def test_non_noisy_skips_llm(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(scraper_module.settings, "cleanup_provider", "hector")
-        monkeypatch.setattr(scraper_module.settings, "hector_provider", "mlx")
-        monkeypatch.setattr(scraper_module.settings, "hector_model", "local-model")
+        monkeypatch.setattr(scraper_module.settings, "cleanup_provider", "emberlm")
+        monkeypatch.setattr(scraper_module.settings, "emberlm_provider", "mlx")
+        monkeypatch.setattr(scraper_module.settings, "emberlm_model", "local-model")
 
         with patch(
             "dendrite_scraper.scraper.llm_clean_markdown", new_callable=AsyncMock
@@ -794,9 +826,9 @@ class TestMaybeLlmClean:
 
     @pytest.mark.asyncio
     async def test_noisy_content_uses_llm(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(scraper_module.settings, "cleanup_provider", "hector")
-        monkeypatch.setattr(scraper_module.settings, "hector_provider", "mlx")
-        monkeypatch.setattr(scraper_module.settings, "hector_model", "local-model")
+        monkeypatch.setattr(scraper_module.settings, "cleanup_provider", "emberlm")
+        monkeypatch.setattr(scraper_module.settings, "emberlm_provider", "mlx")
+        monkeypatch.setattr(scraper_module.settings, "emberlm_model", "local-model")
         noisy = "\n".join(f"[Link {i}](https://example.com/{i})" for i in range(20))
 
         with patch(
@@ -812,9 +844,9 @@ class TestMaybeLlmClean:
     async def test_llm_failure_falls_back_to_original(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(scraper_module.settings, "cleanup_provider", "hector")
-        monkeypatch.setattr(scraper_module.settings, "hector_provider", "mlx")
-        monkeypatch.setattr(scraper_module.settings, "hector_model", "local-model")
+        monkeypatch.setattr(scraper_module.settings, "cleanup_provider", "emberlm")
+        monkeypatch.setattr(scraper_module.settings, "emberlm_provider", "mlx")
+        monkeypatch.setattr(scraper_module.settings, "emberlm_model", "local-model")
         noisy = "\n".join(f"[Link {i}](https://example.com/{i})" for i in range(20))
 
         with patch("dendrite_scraper.scraper.llm_clean_markdown", new=AsyncMock(return_value=None)):

@@ -1,6 +1,6 @@
 """Application settings resolved from environment variables.
 
-Cleanup is optional. It uses Hector-backed local models when noisy scraped
+Cleanup is optional. It uses EmberLM-warmed local models when noisy scraped
 markdown needs a stronger content-extraction pass.
 """
 
@@ -8,7 +8,7 @@ from typing import Literal
 
 from pydantic_settings import BaseSettings
 
-CleanupProvider = Literal["auto", "none", "hector"]
+CleanupProvider = Literal["auto", "none", "emberlm"]
 
 
 class Settings(BaseSettings):
@@ -16,12 +16,13 @@ class Settings(BaseSettings):
 
     @param jina_enabled: Opt-in flag for the third-party Jina Reader fallback (default off).
     @param api_key: Optional API key; when set, POST /scrape requires a matching key.
-    @param cleanup_provider: Cleanup backend: auto, none, or hector.
-    @param hector_provider: Hector provider used for local cleanup.
-    @param hector_model: Hector model used for local cleanup.
-    @param hector_app_name: App name used for Hector leases.
-    @param hector_timeout_seconds: Hector ensure/chat timeout.
-    @param hector_sweep_on_exit: Whether to request sweep when releasing a Hector lease.
+    @param cleanup_provider: Cleanup backend: auto, none, or emberlm.
+    @param emberlm_provider: EmberLM provider used for local cleanup (e.g. mlx, ollama).
+    @param emberlm_model: EmberLM model used for local cleanup.
+    @param emberlm_app_name: App name sent to EmberLM (warm appName + X-EmberLM-App header).
+    @param emberlm_daemon_url: EmberLM daemon base URL for the warm call.
+    @param emberlm_warm_timeout_seconds: Timeout for the EmberLM warm call (blocks until ready).
+    @param emberlm_keep_warm_ms: Optional keep-warm hint passed to EmberLM warm.
     @param host: Bind address for the HTTP server (127.0.0.1 = local only; set 0.0.0.0 to expose).
     @param port: Bind port for the HTTP server.
     @param server_timeout_seconds: Global per-request deadline for POST /scrape.
@@ -41,11 +42,12 @@ class Settings(BaseSettings):
     jina_enabled: bool = False
     api_key: str | None = None
     cleanup_provider: CleanupProvider = "auto"
-    hector_provider: str | None = "mlx"
-    hector_model: str | None = "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"
-    hector_app_name: str = "dendrite-scraper"
-    hector_timeout_seconds: float = 180.0
-    hector_sweep_on_exit: bool = False
+    emberlm_provider: str | None = "mlx"
+    emberlm_model: str | None = "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"
+    emberlm_app_name: str = "dendrite-scraper"
+    emberlm_daemon_url: str = "http://127.0.0.1:17412"
+    emberlm_warm_timeout_seconds: float = 180.0
+    emberlm_keep_warm_ms: int | None = None
     host: str = "127.0.0.1"
     port: int = 8020
     server_timeout_seconds: int = 120

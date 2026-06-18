@@ -40,7 +40,7 @@ GET  /health
 3. **Jina Reader fallback** — free cloud re-fetch when bot-blocked or crawl
    fails
 4. **Noise detection** — link-density heuristic for nav/sidebar chrome
-5. **Model cleanup** — optional Hector local-model pass to strip
+5. **Model cleanup** — optional EmberLM local-model pass to strip
    non-content noise from noisy markdown
 6. **Artifact stripping** — regex patterns for "Skip to content", GitHub
    chrome, duplicate lines
@@ -123,9 +123,10 @@ docker compose up -d
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `DENDRITE_CLEANUP_PROVIDER` | No | Cleanup backend: `auto`, `none`, or `hector` (default: `auto`) |
-| `DENDRITE_HECTOR_PROVIDER` | No | Hector provider for local cleanup (default: `mlx`) |
-| `DENDRITE_HECTOR_MODEL` | No | Hector model for local cleanup (default: `mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit`) |
+| `DENDRITE_CLEANUP_PROVIDER` | No | Cleanup backend: `auto`, `none`, or `emberlm` (default: `auto`) |
+| `DENDRITE_EMBERLM_PROVIDER` | No | EmberLM provider for local cleanup (default: `mlx`) |
+| `DENDRITE_EMBERLM_MODEL` | No | EmberLM model for local cleanup (default: `mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit`) |
+| `DENDRITE_EMBERLM_DAEMON_URL` | No | EmberLM daemon base URL (default: `http://127.0.0.1:17412`) |
 | `DENDRITE_PORT` | No | Server port (default: 8020) |
 | `DENDRITE_HOST` | No | Bind address (default: `127.0.0.1`, local only; set `0.0.0.0` to expose) |
 | `DENDRITE_API_KEY` | No | When set, `POST /scrape` requires a matching `Authorization: Bearer` or `X-API-Key` header |
@@ -134,13 +135,15 @@ docker compose up -d
 | `DENDRITE_MAX_CONCURRENT_SCRAPES` | No | Max concurrent scrapes before `503` (default: 4) |
 | `DENDRITE_CRAWL_TIMEOUT_SECONDS` | No | Crawl4AI timeout (default: 25) |
 
-`auto` uses Hector when `DENDRITE_HECTOR_PROVIDER` and
-`DENDRITE_HECTOR_MODEL` are configured; otherwise cleanup is skipped. Set
+`auto` uses EmberLM when `DENDRITE_EMBERLM_PROVIDER` and
+`DENDRITE_EMBERLM_MODEL` are configured; otherwise cleanup is skipped. Set
 `DENDRITE_CLEANUP_PROVIDER=none` to disable model cleanup entirely.
 
-Hector cleanup requires the Hector Python client to be importable by the
-service, for example by installing `~/dev/hector/clients/hector-py` into the
-same environment.
+EmberLM cleanup requires a running EmberLM daemon (`~/dev/emberlm`) reachable at
+`DENDRITE_EMBERLM_DAEMON_URL`. dendrite warms the model (`POST /v1/warm`) and
+then calls its OpenAI-compatible chat endpoint directly — no EmberLM client
+library needed. If the daemon is unreachable, cleanup is skipped (a warning is
+logged) and the raw scraped markdown is returned.
 
 ## Security
 

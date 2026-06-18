@@ -9,7 +9,7 @@ Pipeline:
   2. Bot detection — Cloudflare/CAPTCHA phrases + partial JS render heuristic
   3. Jina Reader fallback — free cloud re-fetch when bot-blocked or crawl fails
   4. Noise detection — link-density heuristic for nav/sidebar chrome
-  5. Model cleanup — optional Hector pass to strip non-content noise
+  5. Model cleanup — optional EmberLM local-model pass to strip non-content noise
   6. Artifact stripping — regex patterns for common scraper artifacts
 """
 
@@ -21,8 +21,6 @@ import sys
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from importlib import import_module
-from types import SimpleNamespace
 from typing import Any, Literal, cast
 
 import httpx
@@ -75,7 +73,7 @@ CLEANUP_SYSTEM_PROMPT = (
     "detail. Return clean markdown only. No commentary."
 )
 
-ResolvedCleanupProvider = Literal["none", "hector"]
+ResolvedCleanupProvider = Literal["none", "emberlm"]
 
 
 # ── Result types ─────────────────────────────────────────────
@@ -445,13 +443,12 @@ def resolve_cleanup_provider() -> ResolvedCleanupProvider:
     if settings.cleanup_provider == "none":
         return "none"
 
-    if settings.cleanup_provider == "hector":
-        return "hector" if settings.hector_provider and settings.hector_model else "none"
+    configured = bool(settings.emberlm_provider and settings.emberlm_model)
+    if settings.cleanup_provider == "emberlm":
+        return "emberlm" if configured else "none"
 
-    if settings.hector_provider and settings.hector_model:
-        return "hector"
-
-    return "none"
+    # auto
+    return "emberlm" if configured else "none"
 
 
 def cleanup_messages(raw_markdown: str) -> list[dict[str, str]]:
@@ -495,91 +492,87 @@ def extract_chat_content(payload: object) -> str | None:
     return content if isinstance(content, str) and content.strip() else None
 
 
-def find_hector_resident_target(hector: Any) -> object | None:
-    """Find an already-resident Hector target when direct ensure is policy-blocked.
+async def emberlm_warm() -> tuple[str, str] | None:
+    """Warm the configured EmberLM model and return (base_url, qualified_id).
 
-    @param hector: Imported Hector Python SDK module.
-    @returns: Minimal target object compatible with hector.chat, or None.
+    EmberLM is warm-first: POST /v1/warm loads the model and blocks until ready,
+    returning the OpenAI-compatible base URL to send completions to.
+
+    @returns: (base_url, qualified_id) on success, else None.
     """
+    if not settings.emberlm_provider or not settings.emberlm_model:
+        return None
+
+    body: dict[str, object] = {
+        "provider": settings.emberlm_provider,
+        "model": settings.emberlm_model,
+        "appName": settings.emberlm_app_name,
+    }
+    if settings.emberlm_keep_warm_ms is not None:
+        body["keepWarmMs"] = settings.emberlm_keep_warm_ms
+
     try:
-        snapshot = hector.info(timeout=settings.hector_timeout_seconds)
-    except Exception:
-        return None
-
-    if not isinstance(snapshot, dict):
-        return None
-
-    resident_models = snapshot.get("residentModels")
-    if not isinstance(resident_models, list):
-        return None
-
-    for resident in resident_models:
-        if not isinstance(resident, dict):
-            continue
-        if (
-            resident.get("provider") == settings.hector_provider
-            and resident.get("model") == settings.hector_model
-            and isinstance(resident.get("baseUrl"), str)
-            and isinstance(resident.get("model"), str)
-        ):
-            return SimpleNamespace(
-                base_url=resident["baseUrl"],
-                model=resident["model"],
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{settings.emberlm_daemon_url}/v1/warm",
+                json=body,
+                timeout=settings.emberlm_warm_timeout_seconds,
             )
+        if resp.status_code != 200:
+            logger.warning("EmberLM warm failed (%d)", resp.status_code)
+            return None
+        payload = resp.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("EmberLM warm unavailable: %s", exc)
+        return None
 
-    return None
+    if not isinstance(payload, dict):
+        return None
+    base_url = payload.get("baseUrl")
+    qualified_id = payload.get("qualifiedId")
+    if not isinstance(base_url, str) or not isinstance(qualified_id, str):
+        return None
+    return base_url, qualified_id
 
 
-def hector_clean_markdown_sync(raw_markdown: str) -> str | None:
-    """Post-process scraped markdown through a Hector-resolved local model.
+async def emberlm_clean_markdown(raw_markdown: str) -> str | None:
+    """Post-process scraped markdown through an EmberLM-warmed local model.
+
+    Warms the model, then calls its OpenAI-compatible chat endpoint directly —
+    no EmberLM SDK dependency. Calls target the local daemon, so they bypass the
+    SSRF guard by design.
 
     @param raw_markdown: Raw markdown from crawl4ai or Jina.
-    @returns: Cleaned markdown string, or None if Hector cleanup failed/unavailable.
+    @returns: Cleaned markdown string, or None if cleanup failed/unavailable.
     """
-    if not settings.hector_provider or not settings.hector_model:
+    warmed = await emberlm_warm()
+    if warmed is None:
         return None
+    base_url, qualified_id = warmed
 
+    body = {
+        "model": qualified_id,
+        "messages": cleanup_messages(raw_markdown),
+        "max_tokens": 16_000,
+        "temperature": 0,
+    }
     try:
-        hector = cast(Any, import_module("hector"))
-
-        try:
-            target = hector.ensure(
-                provider=settings.hector_provider,
-                model=settings.hector_model,
-                app_name=settings.hector_app_name,
-                sweep_on_exit=settings.hector_sweep_on_exit,
-                timeout=settings.hector_timeout_seconds,
-            )
-        except Exception:
-            target = find_hector_resident_target(hector)
-            if target is None:
-                return None
-
-        try:
-            payload = hector.chat(
-                target,
-                cleanup_messages(raw_markdown),
-                max_tokens=16_000,
-                temperature=0,
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{base_url}/chat/completions",
+                json=body,
+                headers={"X-EmberLM-App": settings.emberlm_app_name},
                 timeout=settings.llm_clean_timeout_seconds,
             )
-        finally:
-            release = getattr(target, "release", None)
-            if callable(release):
-                release(sweep=settings.hector_sweep_on_exit)
-    except Exception:
+        if resp.status_code != 200:
+            logger.warning("EmberLM chat failed (%d)", resp.status_code)
+            return None
+        payload = resp.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("EmberLM chat unavailable: %s", exc)
         return None
 
     return extract_chat_content(payload)
-
-
-async def hector_clean_markdown(raw_markdown: str) -> str | None:
-    """Post-process scraped markdown through Hector without blocking the event loop.
-
-    @param raw_markdown: Raw markdown from crawl4ai or Jina.
-    @returns: Cleaned markdown string, or None if Hector cleanup failed/unavailable.
-    """
-    return await asyncio.to_thread(hector_clean_markdown_sync, raw_markdown)
 
 
 async def llm_clean_markdown(raw_markdown: str) -> str | None:
@@ -589,8 +582,8 @@ async def llm_clean_markdown(raw_markdown: str) -> str | None:
     @returns: Cleaned markdown string, or None if cleanup failed/unavailable.
     """
     provider = resolve_cleanup_provider()
-    if provider == "hector":
-        return await hector_clean_markdown(raw_markdown)
+    if provider == "emberlm":
+        return await emberlm_clean_markdown(raw_markdown)
     return None
 
 
