@@ -1,6 +1,6 @@
 [project]
 name = "dendrite-scraper"
-version = "0.2.0"  # x-release-please-version
+version = "0.2.1"  # x-release-please-version
 description = "Web scraping service with anti-bot detection, Jina fallback, and model cleanup"
 license = "MIT"
 authors = [{ name = "Kevin Frilot" }]

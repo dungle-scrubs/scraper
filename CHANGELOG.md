@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.2.1](https://github.com/dungle-scrubs/dendrite-scraper/compare/v0.2.0...v0.2.1) (2026-06-18)
+
+
+### Added
+
+* replace OpenAI cleanup with Hector ([93c8a78](https://github.com/dungle-scrubs/dendrite-scraper/commit/93c8a78650f5140f26d37d47c90bb2c5e55fd51a))
+* **security:** close SSRF, bound resources, harden server and supply chain ([a206e6d](https://github.com/dungle-scrubs/dendrite-scraper/commit/a206e6d0665c7c6907d333981b9965830e754eae))
+
+
+### Fixed
+
+* **ci:** publish PyPI releases from release workflow ([26c1390](https://github.com/dungle-scrubs/dendrite-scraper/commit/26c139033fe532baf553d596b6a374ea291a784b))
+
+
+### Changed
+
+* **cleanup:** migrate model cleanup from Hector to EmberLM ([900bb37](https://github.com/dungle-scrubs/dendrite-scraper/commit/900bb3764048d3c312a6d38c02b9ac62f59bdcef))
+
+
+### Maintenance
+
+* **deps:** update all dependencies; add starlette&gt;=1.3.0 security floor ([6050a1a](https://github.com/dungle-scrubs/dendrite-scraper/commit/6050a1a2beab8a70eb959e0958aef55f500d2b24))
+* remove trufflehog scan and CI push trigger ([f02c0fe](https://github.com/dungle-scrubs/dendrite-scraper/commit/f02c0fec22b23bbdb2fec8a8e3f83f2f80f54754))
+* update dependencies ([328acd5](https://github.com/dungle-scrubs/dendrite-scraper/commit/328acd5bc194277b55d2f6df469d9a1da0a400ca))
+
 ## [0.2.0](https://github.com/dungle-scrubs/dendrite-scraper/compare/v0.1.0...v0.2.0) (2026-03-06)
 
 
