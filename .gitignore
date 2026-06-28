@@ -1,0 +1,28 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+dist/
+*.egg-info/
+
+# Environment
+.env
+.env.*
+
+# OS
+.DS_Store
+
+# Docker
+.dockerenv
+
+# Logs
+*.log
+
+# Heap/profiling dumps (can contain in-memory secrets — never commit)
+*.heapsnapshot
+
+# Local agent/planning tooling — never commit
+.opencode/
+.plans/

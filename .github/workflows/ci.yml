@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: ci / check
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned by commit SHA (DF-5). Bump via Dependabot; tags shown for reference.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff  # v6
+
+      - name: Format check
+        run: uv run ruff format --check .
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Type check
+        run: uv run ty check
+
+      - name: Test
+        run: uv run pytest tests/ -v
+
+      - name: Dependency audit (F6)
+        # Audit the project's resolved venv, not an ephemeral one. `uvx pip-audit`
+        # (the previous form) ran in an isolated env and saw only pip-audit's own
+        # deps — the project's crawl4ai/lxml/starlette were never scanned. Running
+        # inside the synced venv (via `uv run --with pip-audit`) sees the real
+        # resolved dependency graph and fails on known vulnerabilities.
+        # `--strict` is dropped: the editable dungle-scrubs-scraper package isn't on
+        # PyPI, which --strict makes fatal. pip-audit still fails on actual vulns.
+        run: uv run --with pip-audit pip-audit

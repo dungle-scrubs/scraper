@@ -1,0 +1,36 @@
+services:
+  scraper:
+    build: .
+    ports:
+      # Bind to localhost only by default. To expose beyond localhost, override
+      # with `-p 0.0.0.0:8020:8020` or `ports: ["0.0.0.0:8020:8020"]` and set
+      # SCRAPER_API_KEY. The default avoids accidentally exposing an
+      # unauthenticated scraper on a shared network.
+      - "127.0.0.1:8020:8020"
+    environment:
+      # Bind all interfaces *inside the container* so the published port works;
+      # the published port is still controlled by the `ports:` mapping above.
+      - SCRAPER_HOST=0.0.0.0
+      - SCRAPER_PORT=8020
+      # Require an API key: the container binds 0.0.0.0, so without one the
+      # service is unauthenticated. This fails fast with a clear message if
+      # SCRAPER_API_KEY is unset or empty, rather than silently running open.
+      - SCRAPER_API_KEY=${SCRAPER_API_KEY:?Set SCRAPER_API_KEY (see README)}
+    restart: unless-stopped
+    # Chromium-per-request is memory-hungry; bound it so one request can't OOM
+    # the host. Tune upward for production throughput.
+    mem_limit: 2g
+    cpus: 2.0
+    # Bound process count so runaway Chromium children can't fork-bomb the host.
+    pids_limit: 512
+    healthcheck:
+      # Use stdlib (no extra dep) to match the Dockerfile healthcheck.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request as u; u.urlopen('http://localhost:8020/health').read()"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s

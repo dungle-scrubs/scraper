@@ -1,0 +1,13 @@
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+.ty_cache
+tests/
+.git
+.github/
+docs/
+*.md
+# Local profiler dumps — never bake these into the image (one contained a leaked PAT).
+*.heapsnapshot
