@@ -1,5 +1,5 @@
 # Pin to the declared floor (requires-python >=3.12). Pin by digest for production.
-FROM python:3.12-slim-bookworm
+FROM python:3.14-slim-bookworm
 
 # Playwright system deps for crawl4ai's headless Chromium.
 RUN apt-get update && apt-get install -y --no-install-recommends \
