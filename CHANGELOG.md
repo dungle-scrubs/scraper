@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/dungle-scrubs/scraper/compare/v0.2.0...v0.2.1) (2026-06-28)
+
+
+### Added
+
+* initial public release ([a05187b](https://github.com/dungle-scrubs/scraper/commit/a05187b38858ef75b2ddaf22fcc54ae02cedc9a8))
+
 ## [0.2.0](https://github.com/dungle-scrubs/scraper/compare/v0.1.0...v0.2.0) (2026-03-06)
 
 
