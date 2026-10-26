@@ -14,15 +14,20 @@ Exit codes:
 All logging goes to stderr.  stdout is exclusively for the JSON result.
 """
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 import json
 import logging
 import sys
 from dataclasses import asdict
+from typing import TYPE_CHECKING
 
 from scraper.safety import UrlRejected, validate_url
-from scraper.scraper import ScrapeResult, scrape
+
+if TYPE_CHECKING:
+    from scraper.scraper import ScrapeResult
 
 # ── Exit codes ───────────────────────────────────────────────
 
@@ -112,6 +117,8 @@ async def _run_scrape(url: str, timeout: int) -> tuple[ScrapeResult, int]:
     @param timeout: Maximum wall-clock seconds for the entire pipeline.
     @returns: Tuple of (result, exit_code).
     """
+    from scraper.scraper import ScrapeResult, scrape
+
     try:
         result = await asyncio.wait_for(scrape(url), timeout=timeout)
     except TimeoutError:
@@ -132,6 +139,14 @@ def cmd_scrape(args: argparse.Namespace) -> None:
 
     @param args: Parsed CLI arguments.
     """
+    if args.profile == "public":
+        from scraper.public_profile import cmd_public
+
+        cmd_public(args)
+        return
+
+    from scraper.scraper import ScrapeResult
+
     # Resolve URL from --stdin or positional arg.
     url: str = _read_url_from_stdin() if args.stdin else args.url
     if not url:
@@ -208,6 +223,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help='Read {"url": "..."} from stdin instead of a positional argument.',
     )
+    scrape_p.add_argument("--profile", choices=("default", "public"), default="default")
     scrape_p.add_argument(
         "--timeout",
         type=int,
