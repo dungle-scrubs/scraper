@@ -14,18 +14,27 @@ $ scraper scrape --profile public http://127.0.0.1/
 
 ## Install
 
+Python 3.12 or newer is required. For `public/v1`, run these commands from this
+source checkout, which contains `pyproject.toml` and `uv.lock`:
+
 ```bash
-pip install dungle-scrubs-scraper
-playwright install chromium
-scraper scrape --help
+uv sync --frozen
+uv run --frozen playwright install chromium
+uv run --frozen scraper scrape --help
 ```
 
-Python 3.12 or newer is required. `public/v1` supports the tested runtime pair
-Crawl4AI 0.9.0 and Playwright 1.60.0. Other pairs fail with
-`enforcement_unavailable` on the public path. The default pipeline keeps its
-existing dependency compatibility. The repository lock records the tested pair.
-Linux installations can use `playwright install --with-deps chromium` to install
-browser system dependencies too. Scraping never downloads a browser.
+The checkout lock selects Crawl4AI 0.9.0 and Playwright 1.60.0. That Playwright
+installation supplies Chromium 148.0.7778.96. The public runtime guard rejects
+other versions with `enforcement_unavailable`. On Linux, use
+`uv run --frozen playwright install --with-deps chromium` for system dependencies.
+Scraping never downloads a browser. Use `uv run --frozen` before the CLI examples
+below to run this checkout's executable.
+
+The package is `dungle-scrubs-scraper`. The existing PyPI 0.2.1 release is not an
+installation path for this new flag. Public mode requires this source checkout
+until a separately authorized release. Default CLI and library behavior is
+preserved, but this checkout raises dependency minimums, including Crawl4AI
+0.9.0 and Playwright 1.60.0.
 
 ## Usage
 
@@ -109,14 +118,15 @@ and `error` contain the same stable code. There is one attempt and no fallback.
 | Exit | Default profile | Public profile |
 |---|---|---|
 | 0 | Content scraped | Content scraped |
-| 1 | Backends exhausted | Scrape, content, limit or redirect failure; cancellation |
+| 1 | Backends exhausted | `redirect_rejected`, `navigation_rejected`, `http_status`, `unsupported_content`, `unsupported_encoding`, `too_large`, `bot_detected`, `render_failed`, `cancelled` |
 | 2 | Invalid input | `invalid_input`, `url_rejected`, `credentials_in_url` |
-| 3 | Global timeout | `timeout` |
+| 3 | Global timeout | `timeout`, including per-target DNS validation and the global deadline |
 | 4 | Internal error | `internal`, `enforcement_unavailable`, `cleanup_failed` |
 
-Other public failure codes are `redirect_rejected`, `http_status`,
-`unsupported_content`, `too_large`, `bot_detected`, `render_failed` and `cancelled`.
-Errors never include upstream exception text or a rejected URL.
+The table lists every public failure code. Errors never include upstream
+exception text or a rejected URL. A failed subresource fetch fails the whole
+page with empty content fields. Public mode does not return best-effort success
+with partial content after a subresource failure.
 
 ### Public profile isolation
 
@@ -154,24 +164,27 @@ hostname lookup at connection time. Redirect destinations undergo the same
 checks, with at most five hops. Subresource redirects are blocked, and no 3xx
 response is fulfilled to Chromium.
 
-Chromium stays offline behind an exclusively bound loopback proxy socket that
-never listens or forwards traffic. The descriptor stays open through browser
-and driver cleanup. The tested Playwright runtime forces loopback through this
-proxy. Fulfill-only routing supplies browser HTTP responses from the broker.
+The implementation requests offline mode and configures an exclusively bound
+loopback proxy socket that never listens or forwards traffic. The descriptor
+stays open through browser and driver cleanup. These settings do not establish
+that native browser networking honors the policy. Browser routing supplies HTTP
+responses from the broker.
 Only content type, content language and CORS origin response headers survive;
 Set-Cookie and active redirect or reporting headers do not.
 
 Documents receive an opaque-origin CSP sandbox with scripts enabled. Cookie
-access is disabled before page scripts run. Workers, frames, objects, popups,
-WebSockets, WebRTC and WebTransport are blocked. Required hook and JavaScript
-capability checks fail closed. These restrictions reduce page fidelity.
+access is disabled before page scripts run. CSP, browser hooks and configuration
+restrict workers, frames, objects, popups, WebSockets, WebRTC and WebTransport.
+Required hook and JavaScript capability checks fail closed. These restrictions
+reduce page fidelity.
+A page can fail because a required script or other subresource cannot be fetched.
 
 This is not an airgap, an OS network sandbox or protection against a Chromium
-exploit. Tests cover synthetic native connection attempts and the tested runtime
-pair. Crawl4AI's vendor launch flags, including `--no-sandbox` and
-`--ignore-certificate-errors`, are not claimed to be removed. Native browser
-networking is constrained separately, and the HTTPX broker owns TLS verification.
-No live-source acceptance is claimed.
+exploit. Native-network safety and security verification gaps remain blocking.
+The runtime guards and synthetic tests do not prove policy coverage for native
+browser traffic. Crawl4AI's vendor launch flags include `--no-sandbox` and
+`--ignore-certificate-errors`; the implementation does not remove them. The
+HTTPX broker owns TLS verification. No live-source acceptance is claimed.
 
 ### Public limits and lifecycle
 
@@ -182,15 +195,17 @@ No live-source acceptance is claimed.
 | Render delay before capture | 1.5 seconds |
 | Redirects | 5 |
 | Broker requests | 200 per invocation |
-| Response body | 5,000,000 decompressed bytes |
-| Total broker bodies | 20,000,000 decompressed bytes |
+| Response body | 5,000,000 raw bytes; only identity content encoding accepted |
+| Total broker bodies | 20,000,000 raw bytes |
 | Markdown | 1,000,000 characters |
 | Rendered HTML | 2 MiB UTF-8 |
 | JSON stdout including newline | 8 MiB |
 
 HTML or JSON over the limit produces `too_large` with no partial document.
 `--timeout` defaults to 120 seconds and covers public validation, fetching,
-browser startup and rendering. Cleanup has at most 10 additional seconds,
+browser startup and rendering. Each target's DNS validation has a 5-second
+limit. Either a DNS validation timeout or the global deadline produces `timeout`
+and exit code 3. Cleanup has at most 10 additional seconds,
 including an owned-driver stop if normal browser close fails. SIGINT and
 SIGTERM cancel the task and run cleanup. SIGKILL cannot run cleanup.
 Uncancellable OS DNS calls use bounded daemon workers so they cannot keep the
