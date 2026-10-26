@@ -23,6 +23,7 @@ RUNTIMES = set()
 PROCESSES = {}
 COUNTS = {"tcp": 0, "udp": 0}
 CONTROL = None
+ENCODED_STREAM_READ = False
 LAUNCH_CHECKS = []
 STOP = threading.Event()
 TCP = socket.socket()
@@ -103,6 +104,7 @@ def record():
                 "remaining": remaining,
                 "counts": COUNTS,
                 "control": CONTROL,
+                "encoded_stream_read": ENCODED_STREAM_READ,
                 "launch_checks": LAUNCH_CHECKS,
             }
         )
@@ -145,6 +147,8 @@ if "https://fixture.test/policy" in ARGS:
 
 
 def resolve(host):
+    if host == "dualstack.test":
+        return ["2606:4700:4700::1111", "93.184.216.34"]
     if host == "slow-dns.test":
         # This is an external resolver fault, not a replacement policy outcome.
         import time
@@ -187,6 +191,15 @@ POLICY = """(async()=>{
 })();""".replace("WS_URL", WS_URL)
 
 
+class EncodingTrap(httpx.AsyncByteStream):
+    async def __aiter__(self):
+        global ENCODED_STREAM_READ
+        ENCODED_STREAM_READ = True
+        record()
+        raise RuntimeError("synthetic decoder stream must not be read")
+        yield b""  # pragma: no cover
+
+
 async def respond(request):
     REQUESTS.append(
         {
@@ -197,12 +210,19 @@ async def respond(request):
         }
     )
     record()
+    if request.url.host == "2606:4700:4700::1111":
+        raise httpx.ConnectError("synthetic unavailable IPv6", request=request)
     path = request.url.path
     headers = {
         "content-type": "text/html",
-        "access-control-allow-origin": "*",
         "set-cookie": "response=synthetic; Secure; SameSite=None",
     }
+    if path == "/encoding-trap":
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html", "content-encoding": "br"},
+            stream=EncodingTrap(),
+        )
     status = 200
     body = (
         "<!doctype html><html><head></head><body><h1>Observatory</h1><script>"
@@ -228,6 +248,14 @@ async def respond(request):
         )
     elif path == "/unsafe-asset":
         body = body.replace("</body>", '<img src="http://169.254.169.254/metadata"></body>')
+    elif path == "/cors":
+        body = body.replace("</body>", '<script type="module" src="/module.js"></script></body>')
+    elif path == "/module.js":
+        headers["content-type"] = "application/javascript"
+        body = """const a=await fetch('/article.json',{credentials:'include'}).then(r=>r.json());
+        const b=await new Promise((resolve,reject)=>{const x=new XMLHttpRequest();x.open('GET','/xhr.json');
+          x.withCredentials=true;x.onload=()=>resolve(JSON.parse(x.responseText));x.onerror=reject;x.send()});
+        const p=document.createElement('p');p.id='module';p.textContent='Module fetch and XHR: '+a.article+' '+b.article;document.body.append(p);"""
     elif path == "/slow.js":
         await asyncio.sleep(30)
     elif path == "/slow":
@@ -274,7 +302,7 @@ async def respond(request):
             "/loop": "/loop",
             "/asset-redirect": TCP_URL + "/redirect-target",
         }[path]
-    return httpx.Response(status, headers=headers, content=body)
+    return httpx.Response(status, headers=headers, stream=httpx.ByteStream(body.encode()))
 
 
 patch.object(public, "_open_transport", lambda: httpx.MockTransport(respond)).start()

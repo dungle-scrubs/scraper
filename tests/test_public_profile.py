@@ -343,3 +343,45 @@ def test_cleanup_uses_its_grace_after_rendering_finishes_before_the_deadline(tmp
     events = [json.loads(line) for line in completed.stderr.splitlines()]
     assert next(e["elapsed_ms"] for e in events if e["stage"] == "cleanup") < 5000
     assert events[-1]["elapsed_ms"] > 5000
+
+
+def test_validated_ipv6_connect_failure_falls_back_to_validated_ipv4(tmp_path):
+    completed, boundary = run_cli(tmp_path, "https://dualstack.test/index")
+    assert completed.returncode == 0, completed.stderr
+    assert ARTICLE in json.loads(completed.stdout)["markdown"]
+    assert [r["url"].split("/index")[0] for r in boundary["requests"][:2]] == [
+        "https://[2606:4700:4700::1111]",
+        "https://93.184.216.34",
+    ]
+    assert all(
+        r["headers"]["host"] == "dualstack.test" and r["sni"] == "dualstack.test"
+        for r in boundary["requests"]
+    )
+
+
+def test_broker_supplies_anonymous_cors_for_modules_fetch_and_credentialed_xhr(tmp_path):
+    completed, boundary = run_cli(tmp_path, "https://fixture.test/cors")
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout)
+    assert 'id="module">Module fetch and XHR: ' + ARTICLE + " " + ARTICLE in result["html"]
+    assert "Module fetch and XHR: " + ARTICLE in result["markdown"]
+    assert any(r["url"].endswith("/module.js") for r in boundary["requests"])
+    assert all(
+        not {"cookie", "authorization", "proxy-authorization"} & r["headers"].keys()
+        for r in boundary["requests"]
+    )
+
+
+def test_per_target_dns_timeout_is_typed_as_timeout(tmp_path):
+    completed, boundary = run_cli(tmp_path, "https://slow-dns.test/index", "--timeout", "15")
+    assert completed.returncode == 3, completed.stderr
+    assert json.loads(completed.stdout)["failure"] == "timeout"
+    assert boundary["requests"] == []
+
+
+def test_unexpected_encoding_is_rejected_before_reading_or_decoding_the_body(tmp_path):
+    completed, boundary = run_cli(tmp_path, "https://fixture.test/encoding-trap")
+    assert completed.returncode == 1, completed.stderr
+    assert json.loads(completed.stdout)["failure"] == "unsupported_encoding"
+    assert boundary["encoded_stream_read"] is False
+    assert boundary["requests"][0]["headers"]["accept-encoding"] == "identity"

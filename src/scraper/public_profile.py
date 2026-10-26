@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import importlib.metadata
+import ipaddress
 import json
 import logging
 import os
@@ -29,7 +30,7 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 
 from scraper.content import clean_markdown_content, looks_like_bot_block
-from scraper.safety import UrlRejected, ValidatedTarget, validate_url
+from scraper.safety import UrlRejected, ValidatedTarget, _format_netloc, validate_url
 
 PROFILE_ID = "public/v1"
 DEBUG = False
@@ -78,6 +79,7 @@ class Failure(StrEnum):
     REDIRECT_REJECTED = "redirect_rejected"
     HTTP_STATUS = "http_status"
     UNSUPPORTED_CONTENT = "unsupported_content"
+    UNSUPPORTED_ENCODING = "unsupported_encoding"
     TOO_LARGE = "too_large"
     BOT_DETECTED = "bot_detected"
     RENDER_FAILED = "render_failed"
@@ -301,10 +303,13 @@ class Broker:
             threading.Thread(target=resolve, name="public-resolve", daemon=True).start()
             return await future
 
-    async def fetch(self, url: str, method: str = "GET") -> Document:
+    def count_attempt(self) -> None:
         self.requests += 1
         if self.requests > LIMITS.requests:
             raise PublicError(Failure.TOO_LARGE)
+
+    async def fetch(self, url: str, method: str = "GET") -> Document:
+        self.count_attempt()
         if method not in ("GET", "HEAD"):
             raise PublicError(Failure.URL_REJECTED)
         try:
@@ -312,40 +317,67 @@ class Broker:
             if parts.username is not None or parts.password is not None:
                 raise PublicError(Failure.CREDENTIALS_IN_URL)
             target = await self.validate(url)
-        except (UrlRejected, ValueError, TimeoutError) as exc:
+        except TimeoutError as exc:
+            raise PublicError(Failure.TIMEOUT) from exc
+        except (UrlRejected, ValueError) as exc:
             raise PublicError(Failure.URL_REJECTED) from exc
+        # Prefer IPv6 deterministically, but keep IPv4-only hosts usable. Retry
+        # only connection establishment, never a partially received response.
+        addresses = sorted(
+            set(target.addresses),
+            key=lambda value: (
+                ipaddress.ip_address(value).version != 6,
+                int(ipaddress.ip_address(value)),
+            ),
+        )
+        for index, address in enumerate(addresses):
+            if index:
+                self.count_attempt()
+            try:
+                return await self.fetch_address(target, address, method)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                if index == len(addresses) - 1:
+                    raise PublicError(Failure.RENDER_FAILED) from exc
+            except httpx.HTTPError as exc:
+                raise PublicError(Failure.RENDER_FAILED) from exc
+        raise PublicError(Failure.RENDER_FAILED)
+
+    async def fetch_address(self, target: ValidatedTarget, address: str, method: str) -> Document:
         original = httpx.URL(target.url)
-        pinned = original.copy_with(host=target.addresses[0])
+        pinned = original.copy_with(host=address)
         hostname = original.raw_host.decode("ascii")
-        host = f"[{hostname}]" if ":" in hostname else hostname
-        if target.port is not None:
-            host += f":{target.port}"
-        headers = {"host": host, "accept": "*/*", "user-agent": "scraper-public/v1"}
+        headers = {
+            "host": _format_netloc(hostname, target.port),
+            "accept": "*/*",
+            "accept-encoding": "identity",
+            "user-agent": "scraper-public/v1",
+        }
         extensions = {"sni_hostname": hostname} if target.scheme == "https" else {}
-        try:
-            async with (
-                httpx.AsyncClient(
-                    transport=_open_transport(),
-                    trust_env=False,
-                    follow_redirects=False,
-                    timeout=LIMITS.page_ms / 1000,
-                ) as client,
-                client.stream(method, pinned, headers=headers, extensions=extensions) as response,
+        async with (
+            httpx.AsyncClient(
+                transport=_open_transport(),
+                trust_env=False,
+                follow_redirects=False,
+                timeout=LIMITS.page_ms / 1000,
+            ) as client,
+            client.stream(method, pinned, headers=headers, extensions=extensions) as response,
+        ):
+            if response.headers.get("content-encoding", "identity").strip().lower() not in (
+                "",
+                "identity",
             ):
-                declared = response.headers.get("content-length", "")
-                if declared.isdigit() and int(declared) > LIMITS.response_bytes:
+                raise PublicError(Failure.UNSUPPORTED_ENCODING)
+            declared = response.headers.get("content-length", "")
+            if declared.isdigit() and int(declared) > LIMITS.response_bytes:
+                raise PublicError(Failure.TOO_LARGE)
+            body = bytearray()
+            # Read raw bytes so no HTTPX decompressor can allocate before our cap.
+            async for chunk in response.aiter_raw(chunk_size=65_536):
+                body.extend(chunk)
+                self.bytes += len(chunk)
+                if len(body) > LIMITS.response_bytes or self.bytes > LIMITS.crawl_bytes:
                     raise PublicError(Failure.TOO_LARGE)
-                body = bytearray()
-                async for chunk in response.aiter_bytes(chunk_size=65_536):
-                    body.extend(chunk)
-                    self.bytes += len(chunk)
-                    if len(body) > LIMITS.response_bytes or self.bytes > LIMITS.crawl_bytes:
-                        raise PublicError(Failure.TOO_LARGE)
-                return Document(
-                    target.url, response.status_code, dict(response.headers), bytes(body)
-                )
-        except httpx.HTTPError as exc:
-            raise PublicError(Failure.RENDER_FAILED) from exc
+            return Document(target.url, response.status_code, dict(response.headers), bytes(body))
 
     async def document(self, url: str) -> Document:
         for hop in range(LIMITS.redirects + 1):
@@ -412,9 +444,10 @@ class Enforcement:
                 in (
                     "content-type",
                     "content-language",
-                    "access-control-allow-origin",
                 )
             }
+            headers["access-control-allow-origin"] = "null"
+            headers["access-control-allow-credentials"] = "true"
             if request.resource_type == "document":
                 headers["content-security-policy"] = CSP
             await route.fulfill(status=document.status, headers=headers, body=document.body)
