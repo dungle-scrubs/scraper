@@ -12,8 +12,11 @@ Pipeline:
 """
 
 import asyncio
+import contextlib
 import logging
+import sys
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
@@ -21,7 +24,33 @@ from urllib.parse import urlsplit
 import httpx
 
 from scraper.content import (
-    _suppressed_stdout,
+    BOT_CHALLENGE_MAX_CHARS as BOT_CHALLENGE_MAX_CHARS,
+)
+from scraper.content import (
+    BOT_CHALLENGE_MAX_WORDS as BOT_CHALLENGE_MAX_WORDS,
+)
+from scraper.content import (
+    BOT_DETECTION_PHRASES as BOT_DETECTION_PHRASES,
+)
+from scraper.content import (
+    BOT_EMPTY_CELL_MIN_RATIO as BOT_EMPTY_CELL_MIN_RATIO,
+)
+from scraper.content import (
+    BOT_EMPTY_CELL_MIN_ROWS as BOT_EMPTY_CELL_MIN_ROWS,
+)
+from scraper.content import (
+    BOT_TABLE_PROSE_MIN_WORDS as BOT_TABLE_PROSE_MIN_WORDS,
+)
+from scraper.content import (
+    SCRAPE_ARTIFACT_LINE_PATTERNS as SCRAPE_ARTIFACT_LINE_PATTERNS,
+)
+from scraper.content import (
+    SCRAPE_ARTIFACT_LINE_SUBSTRINGS as SCRAPE_ARTIFACT_LINE_SUBSTRINGS,
+)
+from scraper.content import (
+    STRONG_BOT_SIGNALS as STRONG_BOT_SIGNALS,
+)
+from scraper.content import (
     clean_markdown_content,
     looks_like_bot_block,
 )
@@ -74,6 +103,43 @@ class ScrapeResult:
 
 
 # ── Resource bounding ────────────────────────────────────────
+
+
+# Depth-counted so concurrent crawls in one event loop don't corrupt sys.stdout:
+# only the outermost entry saves/restores the real stream (a naive save/restore
+# per call would capture another in-flight call's already-swapped stream).
+#
+# Atomicity note: the depth counter is mutated without a lock. This is safe in
+# practice because `crawl_url` is the only caller and it holds the body of this
+# context manager synchronously (no `await` between the depth change and the
+# `yield`). A truly interleaving re-entry across separate coroutines is not a
+# supported usage; if one is ever introduced, guard with a per-task structure
+# (e.g. contextvars) instead of a module-level counter.
+_stdout_suppress_depth = 0
+_stdout_real: Any = None
+
+
+@contextlib.contextmanager
+def _suppressed_stdout() -> Iterator[None]:
+    """Silence direct stdout writes (crawl4ai progress bars) - concurrency-safe.
+
+    Safe under nested re-entry from the same call stack (see the atomicity note
+    on the module-level counter above).
+
+    @returns: Context manager that routes stdout to stderr for its duration.
+    """
+    global _stdout_suppress_depth, _stdout_real
+    if _stdout_suppress_depth == 0:
+        _stdout_real = sys.stdout
+        sys.stdout = sys.stderr
+    _stdout_suppress_depth += 1
+    try:
+        yield
+    finally:
+        _stdout_suppress_depth -= 1
+        if _stdout_suppress_depth == 0:
+            sys.stdout = _stdout_real
+            _stdout_real = None
 
 
 def _is_non_retryable_crawl_error(message: str) -> bool:

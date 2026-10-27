@@ -4,9 +4,11 @@ import asyncio
 import atexit
 import contextlib
 import json
+import re
 import socket
 import sys
 import threading
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -24,7 +26,9 @@ PROCESSES = {}
 COUNTS = {"tcp": 0, "udp": 0}
 CONTROL = None
 ENCODED_STREAM_READ = False
-LAUNCH_CHECKS = []
+ENGINES = set()
+NATIVE_JARS = []
+NAVIGATIONS = []
 STOP = threading.Event()
 TCP = socket.socket()
 TCP.bind(("127.0.0.1", 0))
@@ -35,7 +39,6 @@ UDP.bind(("127.0.0.1", 0))
 UDP.settimeout(0.1)
 TCP_URL = f"http://127.0.0.1:{TCP.getsockname()[1]}"
 WS_URL = f"ws://127.0.0.1:{TCP.getsockname()[1]}"
-UDP_PORT = UDP.getsockname()[1]
 
 
 def receive_tcp():
@@ -66,30 +69,29 @@ for thread in THREADS:
     thread.start()
 
 
-def record():
-    if Path.cwd().name == "cwd":
-        RUNTIMES.add(str(Path.cwd().parent))
+def capture_processes():
     for process in psutil.Process().children(recursive=True):
         with contextlib.suppress(psutil.Error):
+            if process.pid in PROCESSES:
+                continue
             PROCESSES[process.pid] = process.create_time()
             args = process.cmdline()
+            if "-juggler-pipe" in args:
+                ENGINES.add("firefox")
             if "--remote-debugging-pipe" in args and not any(a.startswith("--type=") for a in args):
-                LAUNCH_CHECKS.append(
-                    {
-                        "proxy": any(
-                            a.startswith("--proxy-server=http://127.0.0.1:") for a in args
-                        ),
-                        "loopback": "--proxy-bypass-list=<-loopback>" in args,
-                        "no_direct": not any(
-                            "direct://" in a.lower()
-                            or a.startswith("--proxy-pac-url=")
-                            or a == "--proxy-auto-detect"
-                            for a in args
-                        ),
-                    }
-                )
+                ENGINES.add("chromium")
+
+
+def observe_processes():
+    while not STOP.wait(0.01):
+        capture_processes()
+
+
+def record():
+    if Path.cwd().name == "cwd" and Path.cwd().parent.name.startswith("scraper-public-"):
+        RUNTIMES.add(str(Path.cwd().parent))
     remaining = []
-    for pid, created in PROCESSES.items():
+    for pid, created in PROCESSES.copy().items():
         try:
             if psutil.Process(pid).create_time() == created:
                 remaining.append(pid)
@@ -105,7 +107,10 @@ def record():
                 "counts": COUNTS,
                 "control": CONTROL,
                 "encoded_stream_read": ENCODED_STREAM_READ,
-                "launch_checks": LAUNCH_CHECKS,
+                "engines": sorted(ENGINES),
+                "navigations": NAVIGATIONS,
+                "native_jars": NATIVE_JARS,
+                "observed_processes": len(PROCESSES),
             }
         )
     )
@@ -122,16 +127,83 @@ def finish():
 
 atexit.register(finish)
 
+OBSERVER = threading.Thread(target=observe_processes, daemon=True)
+THREADS.append(OBSERVER)
+OBSERVER.start()
+original_chdir = public.os.chdir
+
+
+def observe_chdir(path):
+    original_chdir(path)
+    record()
+
+
+patch.object(public.os, "chdir", observe_chdir).start()
+from playwright.async_api import BrowserContext, Page  # noqa: E402
+
+context_cookies = BrowserContext.cookies
+
+
+async def observe_cookies(self, *args, **kwargs):
+    cookies = await context_cookies(self, *args, **kwargs)
+    NATIVE_JARS.append(len(cookies))
+    record()
+    return cookies
+
+
+patch.object(BrowserContext, "cookies", observe_cookies).start()
+
+page_goto = Page.goto
+
+
+async def observe_goto(self, url, *args, **kwargs):
+    entry = {"url": url, "outcome": "pending"}
+    NAVIGATIONS.append(entry)
+    record()
+    try:
+        result = await page_goto(self, url, *args, **kwargs)
+        entry["outcome"] = "ok"
+        return result
+    except Exception as exc:
+        entry["outcome"] = type(exc).__name__
+        entry["native_errors"] = re.findall(
+            r"\b(?:NS_ERROR_[A-Z_]+|NS_BINDING_[A-Z_]+)\b", str(exc)
+        )
+        raise
+    finally:
+        entry["final_url"] = self.url
+        record()
+
+
+patch.object(Page, "goto", observe_goto).start()
+
 if "https://fixture.test/policy" in ARGS:
     from playwright.async_api import async_playwright
 
     async def native_control():
         async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
+            browser = await playwright.firefox.launch(headless=True, proxy={"server": TCP_URL})
             try:
                 page = await browser.new_page()
                 with contextlib.suppress(Exception):
                     await page.goto(TCP_URL, timeout=2000)
+                await page.close()
+                page = await browser.new_page()
+                await page.route(
+                    "https://control.invalid/",
+                    lambda route: route.fulfill(
+                        status=200,
+                        headers={"set-cookie": "control_response=synthetic; Secure; SameSite=None"},
+                        body="<!doctype html><html><body>Native positive control</body></html>",
+                    ),
+                )
+                await page.goto("https://control.invalid/")
+                capabilities = await page.evaluate("""() => {
+                    document.cookie='control_script=synthetic; Secure; SameSite=None';
+                    return {secure:isSecureContext,rtc:typeof RTCPeerConnection,
+                            transport:typeof WebTransport,cookie:document.cookie};
+                }""")
+                capabilities["jar"] = len(await page.context.cookies())
             finally:
                 await browser.close()
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
@@ -140,10 +212,12 @@ if "https://fixture.test/policy" in ARGS:
             if COUNTS["tcp"] and COUNTS["udp"]:
                 break
             await asyncio.sleep(0.01)
-        return dict(COUNTS)
+        return {**COUNTS, **capabilities}
 
     CONTROL = asyncio.run(native_control())
     COUNTS.update(tcp=0, udp=0)
+    NATIVE_JARS.clear()
+    NAVIGATIONS.clear()
 
 
 def resolve(host):
@@ -170,23 +244,37 @@ fetch('/article.json').then(r=>r.json()).then(d=>{
 });"""
 POLICY = """(async()=>{
  const report=[];
- document.cookie='script=synthetic; Secure; SameSite=None';
- report.push('cookie='+document.cookie, 'cookieStore='+typeof cookieStore);
+ try{document.cookie='script=synthetic; Secure; SameSite=None';report.push('cookie='+document.cookie)}
+ catch(e){report.push('cookie='+e.name)}
  for(const key of ['RTCPeerConnection','webkitRTCPeerConnection','WebTransport']) {
-   let blocked=false;try{Object.defineProperty(window,key,{value:function(){}})}catch(e){blocked=true}
-   report.push(key+'='+typeof window[key]+':'+blocked);
+   report.push(key+'='+typeof window[key]);
  }
  try{localStorage.setItem('probe','synthetic');report.push('storage=unexpected')}catch(e){report.push('storage='+e.name)}
- try{new Worker('/worker.js');report.push('worker=unexpected')}catch(e){report.push('worker='+e.name)}
+ document.addEventListener('securitypolicyviolation',e=>{
+   if(e.violatedDirective==='worker-src')report.push('worker-csp=blocked');
+ });
+ try{await new Promise(resolve=>{
+   const w=new Worker('/worker.js');
+   w.onerror=()=>{report.push('worker=blocked');resolve()};
+   w.onmessage=()=>{report.push('worker=unexpected');resolve()};
+   setTimeout(()=>{report.push('worker=deadline');resolve()},500);
+ })}catch(e){report.push('worker='+e.name)}
+ document.body.dataset.policyPhase='sw';
  try{await navigator.serviceWorker.register('/sw.js');report.push('sw=unexpected')}catch(e){report.push('sw='+e.name)}
+ document.body.dataset.policyPhase='realm';
  try{let f=document.createElement('iframe');document.body.append(f);void f.contentWindow.RTCPeerConnection;report.push('realm=unexpected')}catch(e){report.push('realm='+e.name)}
- report.push('popup='+(window.open('about:blank')===null));
+ document.body.dataset.policyPhase='popup';
+ try{report.push('popup='+(window.open('about:blank')===null))}catch(e){report.push('popup='+e.name)}
+ document.body.dataset.policyPhase='auth';
  await fetch('/auth.json',{credentials:'include',headers:{Authorization:'Bearer synthetic','Proxy-Authorization':'Basic synthetic'}}).catch(()=>{});
+ document.body.dataset.policyPhase='xhr';
  await new Promise(resolve=>{const x=new XMLHttpRequest();x.open('GET','/xhr.json');x.withCredentials=true;
    x.setRequestHeader('Authorization','Bearer synthetic-xhr');x.onload=resolve;x.onerror=resolve;x.send()});
+ document.body.dataset.policyPhase='post';
  await fetch('/post',{method:'POST',body:'synthetic'}).then(()=>report.push('post=unexpected')).catch(()=>report.push('post=blocked'));
  await fetch('/asset-redirect').then(()=>report.push('redirect=unexpected')).catch(()=>report.push('redirect=blocked'));
  await new Promise(resolve=>{const ws=new WebSocket('WS_URL');ws.onclose=()=>{report.push('websocket=closed');resolve()};ws.onerror=()=>{};setTimeout(resolve,800)});
+ document.body.dataset.policyPhase='complete';
  const p=document.createElement('p');p.id='policy';p.textContent=report.join('|');document.body.append(p);
 })();""".replace("WS_URL", WS_URL)
 
@@ -232,10 +320,10 @@ async def respond(request):
     if path.endswith(".json"):
         headers["content-type"] = "application/json"
         body = json.dumps({"article": ARTICLE})
+    if path == "/slow-close":
+        await asyncio.sleep(12)
     if path == "/policy":
-        head = "".join(
-            f'<link rel="{rel}" href="{TCP_URL}/{rel}">' for rel in ("preconnect", "dns-prefetch")
-        )
+        head = "".join(f'<link rel="{rel}" href="{TCP_URL}/{rel}">' for rel in ("preconnect",))
         body = body.replace("</head>", head + "</head>").replace(
             "</body>",
             '<iframe src="/frame"></iframe><object data="/object"></object><script>'
@@ -248,6 +336,16 @@ async def respond(request):
         )
     elif path == "/unsafe-asset":
         body = body.replace("</body>", '<img src="http://169.254.169.254/metadata"></body>')
+    elif path == "/replace-document":
+        body = body.replace(
+            SCRIPT,
+            "setTimeout(()=>{document.open();document.write('<html><body>Replacement</body></html>');document.close()},100);"
+            + SCRIPT,
+        )
+    elif path == "/navigate":
+        body = body.replace(
+            SCRIPT, "setTimeout(()=>location.href='https://other.test/new-document',100);" + SCRIPT
+        )
     elif path == "/cors":
         body = body.replace("</body>", '<script type="module" src="/module.js"></script></body>')
     elif path == "/module.js":
@@ -315,14 +413,22 @@ if "https://fixture.test/fault-runtime" in ARGS:
         "version",
         lambda name: "0.9.1" if name == "crawl4ai" else version(name),
     ).start()
-if "https://fixture.test/fault-hook" in ARGS:
+HOOK_FAULTS = {
+    "https://fixture.test/fault-hook": "on_page_context_created",
+    "https://fixture.test/fault-inspect": "before_retrieve_html",
+    "https://fixture.test/fault-before-goto": "before_goto",
+    "https://fixture.test/fault-identify": "after_goto",
+    "https://fixture.test/fault-capture": "before_return_html",
+}
+if any(url in ARGS for url in HOOK_FAULTS):
     # Real browser and constructors remain in use; omit only the required hook.
     from crawl4ai.async_crawler_strategy import AsyncPlaywrightCrawlerStrategy
 
     set_hook = AsyncPlaywrightCrawlerStrategy.set_hook
 
     def omit_hook(self, name, hook):
-        if name != "on_page_context_created":
+        omitted = next(hook_name for url, hook_name in HOOK_FAULTS.items() if url in ARGS)
+        if name != omitted:
             return set_hook(self, name, hook)
 
     patch.object(AsyncPlaywrightCrawlerStrategy, "set_hook", omit_hook).start()
@@ -333,10 +439,22 @@ if "https://fixture.test/slow-close" in ARGS:
     original_close = Browser.close
 
     async def slow_close(self, *args, **kwargs):
-        await asyncio.sleep(5)
+        # Finish just after the 20s operation deadline, within cleanup's grace.
+        await asyncio.sleep(max(0, 21 - (time.monotonic() - CLI_STARTED)))
         await original_close(self, *args, **kwargs)
 
     patch.object(Browser, "close", slow_close).start()
+
+if "https://fixture.test/fault-capture-navigation" in ARGS:
+    page_content = Page.content
+
+    async def navigate_after_content(self, *args, **kwargs):
+        html = await page_content(self, *args, **kwargs)
+        if self.url == "https://fixture.test/fault-capture-navigation":
+            await self.goto("about:blank")
+        return html
+
+    patch.object(Page, "content", navigate_after_content).start()
 
 if "https://fixture.test/fault-close" in ARGS:
     from playwright.async_api import Browser
@@ -346,15 +464,44 @@ if "https://fixture.test/fault-close" in ARGS:
 
     patch.object(Browser, "close", fail_close).start()
 
-if "https://fixture.test/fault-init" in ARGS:
-    from playwright.async_api import BrowserContext
+if "https://fixture.test/fault-websocket" in ARGS:
 
-    async def omit_init(self, *args, **kwargs):
+    async def omit_websocket(_self, *_args, **_kwargs):
         pass
 
-    patch.object(BrowserContext, "add_init_script", omit_init).start()
+    patch.object(BrowserContext, "route_web_socket", omit_websocket).start()
+
+if any(url.startswith("https://fixture.test/fault-policy-") for url in ARGS):
+    from playwright.async_api import BrowserType
+
+    launch = BrowserType.launch
+
+    async def policy_fault(self, *args, **kwargs):
+        policy_path = Path(public.os.environ["PLAYWRIGHT_FIREFOX_POLICIES_JSON"])
+        fault = next(url.rsplit("fault-policy-", 1)[1] for url in ARGS if "fault-policy-" in url)
+        if fault == "ignored":
+            kwargs["env"] = {
+                key: value
+                for key, value in public.os.environ.items()
+                if key != "PLAYWRIGHT_FIREFOX_POLICIES_JSON"
+            }
+        elif fault == "missing":
+            policy_path.unlink()
+        elif fault == "malformed":
+            policy_path.write_text("{")
+        else:
+            policy = json.loads(policy_path.read_text())
+            if fault == "cookies":
+                del policy["policies"]["Cookies"]
+            else:
+                del policy["policies"]["Preferences"][fault]
+            policy_path.write_text(json.dumps(policy))
+        return await launch(self, *args, **kwargs)
+
+    patch.object(BrowserType, "launch", policy_fault).start()
 
 sys.argv = ["scraper", *ARGS]
 from scraper.cli import main  # noqa: E402
 
+CLI_STARTED = time.monotonic()
 main()

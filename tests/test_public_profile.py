@@ -1,13 +1,15 @@
-"""Production CLI contract with real Chromium and synthetic external transport."""
+"""Production CLI contract with real Firefox and synthetic external transport."""
 
 import json
 import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
+import psutil
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,6 +19,8 @@ BOOTSTRAP = (Path(__file__).parent / "public_cli_fixture.py").read_text()
 
 def cli_env(tmp_path, extra_env=None):
     cache = Path.home() / ("Library/Caches" if sys.platform == "darwin" else ".cache")
+    if sys.platform != "darwin":
+        cache = Path(os.environ.get("XDG_CACHE_HOME") or cache)
     locator = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", str(cache / "ms-playwright"))
     return {
         "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
@@ -29,19 +33,86 @@ def cli_env(tmp_path, extra_env=None):
 
 def run_cli(tmp_path, *args, bootstrap=BOOTSTRAP, extra_env=None, stdin=None):
     record = tmp_path / "boundary.json"
-    completed = subprocess.run(
-        [sys.executable, "-c", bootstrap, str(record), "scrape", "--profile", "public", *args],
+    command = [sys.executable, "-c", bootstrap, str(record), "scrape", "--profile", "public", *args]
+    process = subprocess.Popen(
+        command,
         env=cli_env(tmp_path, extra_env),
         cwd=tmp_path,
-        input=stdin,
-        capture_output=True,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=40,
     )
+    observed = {}
+    stop = threading.Event()
+    root = psutil.Process(process.pid)
+
+    def observe():
+        while not stop.is_set():
+            try:
+                for child in root.children(recursive=True):
+                    observed[child.pid] = child.create_time()
+            except psutil.Error:
+                pass
+            stop.wait(0.005)
+
+    observer = threading.Thread(target=observe, daemon=True)
+    observer.start()
+    try:
+        stdout, stderr = process.communicate(input=stdin, timeout=60)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.communicate(timeout=12)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+        stop.set()
+        observer.join()
+    (tmp_path / "stdout.json").write_text(stdout)
+    (tmp_path / "stderr.jsonl").write_text(stderr)
+    completed = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    remaining = []
+    for pid, created in observed.items():
+        try:
+            child = psutil.Process(pid)
+            if child.create_time() == created:
+                remaining.append(child)
+        except psutil.Error:
+            pass
+    _, remaining = psutil.wait_procs(remaining, timeout=1)
+    try:
+        assert not remaining, [p.pid for p in remaining]
+    finally:
+        for child in remaining:
+            try:
+                if child.create_time() == observed[child.pid]:
+                    child.kill()
+            except psutil.Error:
+                pass
+
     boundary = json.loads(record.read_text()) if record.exists() else {}
     assert all(not Path(path).exists() for path in boundary.get("runtimes", [])), boundary
     assert boundary.get("remaining", []) == [], boundary
+    events = [
+        json.loads(line) for line in completed.stderr.splitlines() if line.startswith('{"profile":')
+    ]
+    if any(e["stage"] == "fetch" for e in events):
+        assert boundary["runtimes"], "isolation was entered but not observed"
+    if any(e["stage"] == "browser" for e in events):
+        assert observed, "real-browser lifecycle was not observed externally"
+        assert boundary["observed_processes"] > 0
     return completed, boundary
+
+
+def test_public_cli_uses_native_firefox_for_javascript_output(tmp_path):
+    completed, boundary = run_cli(tmp_path, "https://fixture.test/index")
+    assert completed.returncode == 0, (completed.stderr, boundary)
+    result = json.loads(completed.stdout)
+    assert ARTICLE in result["markdown"] and f"<p>{ARTICLE}</p>" in result["html"]
+    assert boundary["engines"] == ["firefox"]
+    assert boundary["counts"] == {"tcp": 0, "udp": 0}
 
 
 def test_public_cli_returns_javascript_article_html_and_markdown(tmp_path):
@@ -58,7 +129,8 @@ def test_public_cli_returns_javascript_article_html_and_markdown(tmp_path):
     assert "scraper.settings" not in boundary["modules"]
     assert "scraper.scraper" not in boundary["modules"]
     assert boundary["runtimes"]
-    assert boundary["launch_checks"] and all(all(c.values()) for c in boundary["launch_checks"])
+    assert boundary["engines"] == ["firefox"]
+    assert boundary["navigations"][0]["url"] == "https://public-profile.invalid/readiness"
 
 
 def test_hostile_configuration_cannot_enable_settings_jina_or_browser_state(tmp_path):
@@ -76,12 +148,15 @@ def test_hostile_configuration_cannot_enable_settings_jina_or_browser_state(tmp_
             "CRAWL4_AI_BASE_DIRECTORY": str(tmp_path / "forbidden"),
             "PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK": "1",
             "TMPDIR": str(inherited_tmp),
+            "PLAYWRIGHT_FIREFOX_POLICIES_JSON": str(tmp_path / "not-an-owned-policy.json"),
         },
     )
     assert completed.returncode == 0, completed.stderr
     assert ARTICLE in json.loads(completed.stdout)["markdown"]
     assert "scraper.settings" not in boundary["modules"]
     assert "scraper.scraper" not in boundary["modules"]
+    assert boundary["engines"] == ["firefox"]
+    assert boundary["native_jars"] and set(boundary["native_jars"]) == {0}
     assert not (tmp_path / "forbidden").exists()
     assert all(not Path(p).is_relative_to(inherited_tmp) for p in boundary["runtimes"])
     assert all(r["headers"]["host"] == "fixture.test" for r in boundary["requests"])
@@ -97,26 +172,36 @@ def test_hostile_configuration_cannot_enable_settings_jina_or_browser_state(tmp_
     assert "ValidationError" in control.stderr
 
 
-def test_cookie_authorization_and_native_capabilities_at_actual_browser_boundary(tmp_path):
+def test_native_policy_cookie_authorization_and_csp_at_actual_browser_boundary(tmp_path):
     completed, boundary = run_cli(tmp_path, "https://fixture.test/policy")
     assert completed.returncode == 0, completed.stderr
     html = json.loads(completed.stdout)["html"]
     for expected in (
-        "cookie=|cookieStore=undefined",
-        "RTCPeerConnection=undefined:true",
-        "webkitRTCPeerConnection=undefined:true",
-        "WebTransport=undefined:true",
+        "cookie=SecurityError",
+        "RTCPeerConnection=undefined",
+        "webkitRTCPeerConnection=undefined",
+        "WebTransport=undefined",
         "storage=SecurityError",
-        "worker=SecurityError",
+        "worker=blocked",
+        "worker-csp=blocked",
         "sw=SecurityError",
         "realm=SecurityError",
-        "popup=true",
+        "popup=InvalidAccessError",
         "post=blocked",
         "redirect=blocked",
         "websocket=closed",
     ):
-        assert expected in html
+        assert expected in html, (expected, html[:400], html.split('<p id="policy">')[-1][:600])
     assert boundary["control"]["tcp"] > 0 and boundary["control"]["udp"] > 0
+    assert boundary["control"]["secure"] is True
+    assert boundary["control"]["rtc"] == "function"
+    assert boundary["control"]["transport"] == "function"
+    assert boundary["control"]["jar"] == 2
+    assert "control_response=synthetic" in boundary["control"]["cookie"]
+    assert "control_script=synthetic" in boundary["control"]["cookie"]
+    assert boundary["native_jars"] and set(boundary["native_jars"]) == {0}
+    assert boundary["navigations"][0]["url"] == "https://public-profile.invalid/readiness"
+    assert boundary["navigations"][1]["url"] == "https://fixture.test/policy"
     requests = boundary["requests"]
     paths = {r["url"].split("93.184.216.34", 1)[-1] for r in requests}
     assert {"/auth.json", "/xhr.json", "/asset-redirect"} <= paths
@@ -134,6 +219,7 @@ def test_cookie_authorization_and_native_capabilities_at_actual_browser_boundary
     "url,failure,exit_status",
     [
         ("https://synthetic:synthetic@fixture.test/", "credentials_in_url", 2),
+        ("https://synthetic@fixture.test/", "credentials_in_url", 2),
         ("http://127.0.0.1/", "url_rejected", 2),
         ("http://[::ffff:127.0.0.1]/", "url_rejected", 2),
         ("file:///etc/passwd", "url_rejected", 2),
@@ -144,7 +230,7 @@ def test_cookie_authorization_and_native_capabilities_at_actual_browser_boundary
         ("https://fixture.test/http-error", "http_status", 1),
         ("https://fixture.test/bot", "bot_detected", 1),
         ("https://fixture.test/unsafe-asset", "url_rejected", 2),
-        ("https://fixture.test/refresh", "url_rejected", 2),
+        ("https://fixture.test/refresh", "navigation_rejected", 1),
     ],
 )
 def test_public_rejections_are_typed_and_do_not_leak_input(tmp_path, url, failure, exit_status):
@@ -185,7 +271,18 @@ def test_public_limits_fail_without_a_partial_document(tmp_path, path):
     assert json.loads(completed.stderr.splitlines()[-1])["outcome"] == "too_large"
 
 
-@pytest.mark.parametrize("path", ["fault-runtime", "fault-hook", "fault-init"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "fault-runtime",
+        "fault-hook",
+        "fault-websocket",
+        "fault-inspect",
+        "fault-before-goto",
+        "fault-identify",
+        "fault-capture",
+    ],
+)
 def test_lost_required_capabilities_fail_closed(tmp_path, path):
     completed, _boundary = run_cli(tmp_path, "https://fixture.test/" + path)
     assert completed.returncode == 4, completed.stderr
@@ -204,10 +301,10 @@ def test_public_stdin_errors_are_versioned_and_typed(tmp_path, stdin):
 
 def test_wall_timeout_closes_real_browser_and_records_stage_outcomes(tmp_path):
     start = time.monotonic()
-    completed, boundary = run_cli(tmp_path, "https://fixture.test/slow", "--timeout", "4")
+    completed, boundary = run_cli(tmp_path, "https://fixture.test/slow", "--timeout", "15")
     assert completed.returncode == 3, completed.stderr
     assert json.loads(completed.stdout)["failure"] == "timeout"
-    assert time.monotonic() - start < 15
+    assert time.monotonic() - start < 26
     assert any(r["url"].endswith("/slow.js") for r in boundary["requests"])
     events = [json.loads(line) for line in completed.stderr.splitlines()]
     assert all(
@@ -275,6 +372,26 @@ def test_wall_timeout_includes_a_resolver_that_does_not_return(tmp_path):
     assert boundary["requests"] == []
 
 
+def test_same_url_document_replacement_during_capture_is_rejected(tmp_path):
+    completed, boundary = run_cli(tmp_path, "https://fixture.test/replace-document")
+    assert completed.returncode == 1, completed.stderr
+    result = json.loads(completed.stdout)
+    assert result["failure"] == "navigation_rejected"
+    assert not result["html"] and not result["markdown"]
+    assert boundary["counts"] == {"tcp": 0, "udp": 0}
+
+
+def test_navigation_after_serialization_cannot_return_stale_html(tmp_path):
+    completed, boundary = run_cli(tmp_path, "https://fixture.test/fault-capture-navigation")
+    assert completed.returncode == 1, completed.stderr
+    result = json.loads(completed.stdout)
+    assert result["failure"] == "navigation_rejected"
+    assert not result["html"] and not result["markdown"]
+    assert boundary["navigations"][-1]["url"] == "about:blank"
+    assert len(boundary["requests"]) == 2
+    assert boundary["counts"] == {"tcp": 0, "udp": 0}
+
+
 def test_missing_browser_installation_is_an_enforcement_failure(tmp_path):
     completed, _boundary = run_cli(
         tmp_path,
@@ -337,12 +454,12 @@ def test_markdown_cap_preserves_the_complete_bounded_html(tmp_path):
 
 
 def test_cleanup_uses_its_grace_after_rendering_finishes_before_the_deadline(tmp_path):
-    completed, _boundary = run_cli(tmp_path, "https://fixture.test/slow-close", "--timeout", "5")
+    completed, _boundary = run_cli(tmp_path, "https://fixture.test/slow-close", "--timeout", "20")
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout)["ok"] is True
     events = [json.loads(line) for line in completed.stderr.splitlines()]
-    assert next(e["elapsed_ms"] for e in events if e["stage"] == "cleanup") < 5000
-    assert events[-1]["elapsed_ms"] > 5000
+    assert next(e["elapsed_ms"] for e in events if e["stage"] == "cleanup") < 20000
+    assert events[-1]["elapsed_ms"] > 20000
 
 
 def test_validated_ipv6_connect_failure_falls_back_to_validated_ipv4(tmp_path):
@@ -385,3 +502,67 @@ def test_unexpected_encoding_is_rejected_before_reading_or_decoding_the_body(tmp
     assert json.loads(completed.stdout)["failure"] == "unsupported_encoding"
     assert boundary["encoded_stream_read"] is False
     assert boundary["requests"][0]["headers"]["accept-encoding"] == "identity"
+
+
+def test_public_document_navigation_fails_before_fetching_a_differently_labelled_page(tmp_path):
+    completed, boundary = run_cli(tmp_path, "https://fixture.test/navigate")
+    assert completed.returncode == 1, completed.stderr
+    result = json.loads(completed.stdout)
+    assert result["failure"] == "navigation_rejected" and not result["html"]
+    assert not any(r["url"].endswith("/new-document") for r in boundary["requests"])
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing",
+        "malformed",
+        "cookies",
+        "media.peerconnection.enabled",
+        "network.webtransport.enabled",
+        "network.http.http3.enable",
+        "network.dns.disablePrefetch",
+        "network.http.speculative-parallel-limit",
+        "network.predictor.enabled",
+        "network.prefetch-next",
+        "network.proxy.allow_hijacking_localhost",
+    ],
+)
+def test_missing_or_partial_native_policy_fails_before_product_navigation(tmp_path, fault):
+    url = "https://fixture.test/fault-policy-" + fault
+    completed, boundary = run_cli(tmp_path, url)
+    assert completed.returncode == 4, completed.stderr
+    assert json.loads(completed.stdout)["failure"] == "enforcement_unavailable"
+    assert all(nav["url"] != url for nav in boundary["navigations"])
+    assert len(boundary["requests"]) == 1  # Only the validated document prefetch.
+    assert boundary["counts"] == {"tcp": 0, "udp": 0}
+
+
+def test_readiness_failure_records_the_trusted_stage_and_cleanup(tmp_path):
+    completed, boundary = run_cli(tmp_path, "https://fixture.test/fault-policy-ignored")
+    assert completed.returncode == 4, completed.stderr
+    events = [json.loads(line) for line in completed.stderr.splitlines()]
+    assert [e["outcome"] for e in events if e["stage"] == "enforcement"] == [
+        "pending",
+        "enforcement_unavailable",
+    ]
+    assert [e["outcome"] for e in events if e["stage"] == "browser"] == [
+        "pending",
+        "enforcement_unavailable",
+    ]
+    assert [e["outcome"] for e in events if e["stage"] == "cleanup"] == ["pending", "ok"]
+    assert all(
+        nav["url"] != "https://fixture.test/fault-policy-ignored" for nav in boundary["navigations"]
+    )
+
+
+def test_native_readiness_refuses_an_unconsumed_policy_before_product_navigation(tmp_path):
+    url = "https://fixture.test/fault-policy-ignored"
+    completed, boundary = run_cli(tmp_path, url)
+    assert completed.returncode == 4, completed.stderr
+    assert json.loads(completed.stdout)["failure"] == "enforcement_unavailable"
+    assert [nav["url"] for nav in boundary["navigations"]] == [
+        "https://public-profile.invalid/readiness"
+    ]
+    assert boundary["counts"] == {"tcp": 0, "udp": 0}
+    assert len(boundary["requests"]) == 1

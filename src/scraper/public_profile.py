@@ -1,8 +1,8 @@
 """Internal, CLI-only anonymous rendering policy, version public/v1.
 
-The browser is offline behind a held, non-listening proxy socket. Only the
-stateless broker connects to validated public addresses. This is not an OS
-network sandbox or protection against a browser exploit.
+Firefox uses an owned native startup policy and a held, non-listening HTTP
+proxy. Routed requests are fulfilled by the stateless validated-address broker.
+This is not an OS network sandbox or protection against a browser exploit.
 """
 
 from __future__ import annotations
@@ -29,30 +29,34 @@ from urllib.parse import urljoin, urlsplit
 
 import httpx
 
+from scraper.cli import EXIT_INTERNAL, EXIT_INVALID_INPUT, EXIT_OK, EXIT_SCRAPE_FAILED, EXIT_TIMEOUT
 from scraper.content import clean_markdown_content, looks_like_bot_block
 from scraper.safety import UrlRejected, ValidatedTarget, _format_netloc, validate_url
 
 PROFILE_ID = "public/v1"
 DEBUG = False
 CSP = "sandbox allow-scripts; worker-src 'none'; frame-src 'none'; child-src 'none'; object-src 'none'"
-INIT = r"""(() => {
-  Object.defineProperty(Document.prototype, 'cookie', {
-    get() { return ''; }, set(value) {}, configurable: false, enumerable: true
-  });
-  for (const key of ['cookieStore', 'RTCPeerConnection', 'webkitRTCPeerConnection', 'WebTransport']) {
-    Object.defineProperty(globalThis, key, {value: undefined, writable: false, configurable: false});
-  }
-})();"""
-CAPABILITY = """() => {
-  const cookie = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie');
-  if (!cookie || cookie.configurable || document.cookie !== '') return false;
-  for (const key of ['cookieStore','RTCPeerConnection','webkitRTCPeerConnection','WebTransport']) {
-    const d = Object.getOwnPropertyDescriptor(globalThis, key);
-    if (!d || d.configurable || d.writable || typeof globalThis[key] !== 'undefined') return false;
-  }
-  try { localStorage.getItem('public-capability'); return false; }
-  catch (e) { return e.name === 'SecurityError'; }
-}"""
+# Playwright 1.60's native Firefox policy provider reads this file before UI startup.
+NATIVE_POLICY = {
+    "policies": {
+        "Cookies": {"Behavior": "reject", "BehaviorPrivateBrowsing": "reject", "Locked": True},
+        "Preferences": {
+            name: {"Value": value, "Status": "locked", "Type": kind}
+            for name, value, kind in (
+                ("media.peerconnection.enabled", False, "boolean"),
+                ("network.webtransport.enabled", False, "boolean"),
+                ("network.http.http3.enable", False, "boolean"),
+                ("network.dns.disablePrefetch", True, "boolean"),
+                ("network.http.speculative-parallel-limit", 0, "number"),
+                ("network.predictor.enabled", False, "boolean"),
+                ("network.prefetch-next", False, "boolean"),
+                ("network.proxy.allow_hijacking_localhost", True, "boolean"),
+            )
+        },
+    }
+}
+READINESS_URL = "https://public-profile.invalid/readiness"
+READINESS_WS = "wss://public-profile.invalid/readiness"
 
 
 @dataclass(frozen=True)
@@ -67,6 +71,9 @@ class PublicLimits:
     html_bytes: int = 2 * 1024 * 1024
     json_bytes: int = 8 * 1024 * 1024
     cleanup_seconds: float = 10
+    resolver_workers: int = 8
+    render_delay_seconds: float = 1.5
+    stdin_chars: int = 1_048_576
 
 
 LIMITS = PublicLimits()
@@ -77,6 +84,7 @@ class Failure(StrEnum):
     URL_REJECTED = "url_rejected"
     CREDENTIALS_IN_URL = "credentials_in_url"
     REDIRECT_REJECTED = "redirect_rejected"
+    NAVIGATION_REJECTED = "navigation_rejected"
     HTTP_STATUS = "http_status"
     UNSUPPORTED_CONTENT = "unsupported_content"
     UNSUPPORTED_ENCODING = "unsupported_encoding"
@@ -122,70 +130,81 @@ def failure_result(failure: Failure, elapsed_ms: float = 0) -> PublicResult:
     )
 
 
-def serialize(result: PublicResult) -> str:
+def serialize(result: PublicResult) -> tuple[PublicResult, str]:
     text = json.dumps(asdict(result), ensure_ascii=True)
-    if len(text.encode("utf-8")) + 1 > LIMITS.json_bytes:
-        return json.dumps(asdict(failure_result(Failure.TOO_LARGE, result.elapsed_ms)))
-    return text
+    if len(text) + 1 > LIMITS.json_bytes:
+        result = failure_result(Failure.TOO_LARGE, result.elapsed_ms)
+        text = json.dumps(asdict(result), ensure_ascii=True)
+    return result, text
 
 
 def exit_code(result: PublicResult) -> int:
     if result.ok:
-        return 0
+        return EXIT_OK
     if result.failure in (Failure.INVALID_INPUT, Failure.URL_REJECTED, Failure.CREDENTIALS_IN_URL):
-        return 2
+        return EXIT_INVALID_INPUT
     if result.failure == Failure.TIMEOUT:
-        return 3
+        return EXIT_TIMEOUT
     if result.failure in (
         Failure.INTERNAL,
         Failure.ENFORCEMENT_UNAVAILABLE,
         Failure.CLEANUP_FAILED,
     ):
-        return 4
-    return 1
+        return EXIT_INTERNAL
+    return EXIT_SCRAPE_FAILED
+
+
+class Stage(StrEnum):
+    PUBLIC = "public"
+    FETCH = "fetch"
+    BROWSER = "browser"
+    ENFORCEMENT = "enforcement"
+    CLEANUP = "cleanup"
+    BROKER = "broker"
+
+
+class Event(StrEnum):
+    START = "start"
+    END = "end"
+    COUNTERS = "counters"
 
 
 class Records:
     def __init__(self, stream: TextIO):
         self.stream = stream
         self.id = uuid.uuid4().hex
-        self.stage = "input"
+        self.stage = Stage.PUBLIC
         self.started = time.monotonic()
+
+    def write(
+        self,
+        stage: Stage,
+        event: Event,
+        outcome: str | None = None,
+        requests: int | None = None,
+        body_bytes: int | None = None,
+    ) -> None:
+        self.stage = stage
+        payload: dict[str, Any] = {
+            "profile": PROFILE_ID,
+            "id": self.id,
+            "stage": stage,
+            "event": event,
+            "elapsed_ms": round((time.monotonic() - self.started) * 1000, 3),
+        }
+        if outcome is not None:
+            payload["outcome"] = outcome
+        if requests is not None:
+            payload["requests"] = requests
+            payload["body_bytes"] = body_bytes
+        print(json.dumps(payload), file=self.stream, flush=True)
 
     def counters(self, requests: int, body_bytes: int) -> None:
         if DEBUG:
-            print(
-                json.dumps(
-                    {
-                        "profile": PROFILE_ID,
-                        "id": self.id,
-                        "stage": "broker",
-                        "event": "counters",
-                        "requests": requests,
-                        "body_bytes": body_bytes,
-                        "elapsed_ms": round((time.monotonic() - self.started) * 1000, 3),
-                    }
-                ),
-                file=self.stream,
-                flush=True,
-            )
+            self.write(Stage.BROKER, Event.COUNTERS, requests=requests, body_bytes=body_bytes)
 
-    def emit(self, stage: str, event: str, outcome: str = "pending") -> None:
-        self.stage = stage
-        print(
-            json.dumps(
-                {
-                    "profile": PROFILE_ID,
-                    "id": self.id,
-                    "stage": stage,
-                    "event": event,
-                    "outcome": outcome,
-                    "elapsed_ms": round((time.monotonic() - self.started) * 1000, 3),
-                }
-            ),
-            file=self.stream,
-            flush=True,
-        )
+    def emit(self, stage: Stage, event: Event, outcome: str = "pending") -> None:
+        self.write(stage, event, outcome)
 
 
 @contextlib.contextmanager
@@ -269,7 +288,7 @@ class Broker:
     def __init__(self):
         self.requests = 0
         self.bytes = 0
-        self.resolvers = asyncio.Semaphore(8)
+        self.resolvers = asyncio.Semaphore(LIMITS.resolver_workers)
 
     async def validate(self, url: str) -> ValidatedTarget:
         # OS DNS is not cancellable. Unlike ThreadPoolExecutor workers, these
@@ -410,15 +429,27 @@ def _request_key(url: str) -> tuple[str, bytes, int | None, bytes]:
 
 
 class Enforcement:
-    def __init__(self, broker: Broker, document: Document):
+    def __init__(self, broker: Broker, document: Document, policy_path: Path, records: Records):
         self.broker = broker
         self.document = document
+        self.policy_path = policy_path
+        self.records = records
         self.installed = False
+        self.navigation_started = False
         self.served = False
         self.checked = False
         self.failure: Failure | None = None
+        self.page: Any = None
+        self.root: Any = None
+        self.navigations = 0
+        self.captured: str | None = None
+        self.readiness_ws = False
 
     async def route(self, route: Any) -> None:
+        if not self.navigation_started:
+            self.failure = Failure.ENFORCEMENT_UNAVAILABLE
+            await route.abort("blockedbyclient")
+            return
         request = route.request
         if request.method not in ("GET", "HEAD"):
             await route.abort("blockedbyclient")
@@ -432,8 +463,13 @@ class Enforcement:
                 document = self.document
                 self.served = True
             else:
+                if (
+                    request.is_navigation_request()
+                    and request.frame == request.frame.page.main_frame
+                ):
+                    raise PublicError(Failure.NAVIGATION_REJECTED)
                 document = await self.broker.fetch(request.url, request.method)
-            # Redirects are followed only by document prefetch, never by Chromium.
+            # Redirects are followed only by document prefetch, never by the browser.
             if 300 <= document.status < 400:
                 await route.abort("blockedbyclient")
                 return
@@ -458,34 +494,152 @@ class Enforcement:
             self.failure = Failure.ENFORCEMENT_UNAVAILABLE
             await route.abort("blockedbyclient")
 
+    async def native_readiness(self, context: Any) -> None:
+        # Check the entire owned file, then test native effects in a fresh secure
+        # document with no caller scripts. Pinned native policy consumers supply
+        # the lock/transport argument; this is not a privileged preference getter.
+        if json.loads(self.policy_path.read_text(encoding="utf-8")) != NATIVE_POLICY:
+            raise PublicError(Failure.ENFORCEMENT_UNAVAILABLE)
+        await context.route_web_socket("**/*", self.websocket)
+        trusted = await context.new_page()
+        try:
+
+            async def readiness_route(route: Any) -> None:
+                if route.request.url == READINESS_URL and route.request.method == "GET":
+                    await route.fulfill(
+                        status=200,
+                        headers={
+                            "content-type": "text/html",
+                            "set-cookie": "readiness_response=synthetic; Secure; SameSite=None",
+                        },
+                        body="<!doctype html><html><body>Public policy readiness</body></html>",
+                    )
+                else:
+                    await route.abort("blockedbyclient")
+
+            await trusted.route("**/*", readiness_route)
+            await trusted.goto(READINESS_URL, wait_until="load")
+            ready = await trusted.evaluate("""async () => {
+                document.cookie='readiness_script=synthetic; Secure; SameSite=None';
+                const closed = await new Promise(resolve => {
+                    const ws = new WebSocket('wss://public-profile.invalid/readiness');
+                    ws.onclose=()=>resolve(true);
+                    ws.onerror=()=>{};
+                    setTimeout(()=>resolve(false),1000);
+                });
+                return {
+                    secure: isSecureContext,
+                    rtc: typeof RTCPeerConnection,
+                    rtcAlias: typeof webkitRTCPeerConnection,
+                    transport: typeof WebTransport,
+                    cookies: document.cookie,
+                    closed
+                };
+            }""")
+            if (
+                ready
+                != {
+                    "secure": True,
+                    "rtc": "undefined",
+                    "rtcAlias": "undefined",
+                    "transport": "undefined",
+                    "cookies": "",
+                    "closed": True,
+                }
+                or not self.readiness_ws
+                or await context.cookies()
+            ):
+                raise PublicError(Failure.ENFORCEMENT_UNAVAILABLE)
+        finally:
+            await trusted.close()
+
     async def install(self, page: Any, context: Any, **_kwargs: Any) -> Any:
         from playwright.async_api import BrowserContext
 
+        self.records.emit(Stage.ENFORCEMENT, Event.START)
         try:
-            if not isinstance(context, BrowserContext):
+            if (
+                not isinstance(context, BrowserContext)
+                or context.browser.browser_type.name != "firefox"
+                or context.browser.version != "150.0.2"
+            ):
                 raise PublicError(Failure.ENFORCEMENT_UNAVAILABLE)
-            await context.set_offline(True)
             await context.clear_cookies()
-            await context.add_init_script(script=INIT)
-            await context.route_web_socket("**/*", self.websocket)
+            await self.native_readiness(context)
+            self.page = page
+            page.on("framenavigated", self.navigated)
             await context.route("**/*", self.route)
             self.installed = True
+        except asyncio.CancelledError:
+            self.records.emit(Stage.ENFORCEMENT, Event.END, Failure.CANCELLED)
+            raise
         except Exception as exc:
             self.failure = Failure.ENFORCEMENT_UNAVAILABLE
+            self.records.emit(Stage.ENFORCEMENT, Event.END, self.failure)
             raise PublicError(self.failure) from exc
+        self.records.emit(Stage.ENFORCEMENT, Event.END, "ok")
+        return page
+
+    async def before_goto(self, page: Any, **_kwargs: Any) -> Any:
+        if not self.installed or page is not self.page:
+            self.failure = Failure.ENFORCEMENT_UNAVAILABLE
+            raise PublicError(self.failure)
+        self.navigation_started = True
         return page
 
     async def websocket(self, ws: Any) -> None:
+        if ws.url == READINESS_WS:
+            self.readiness_ws = True
         await ws.close(code=1008, reason="public profile")
+
+    def navigated(self, frame: Any) -> None:
+        if frame == self.page.main_frame:
+            self.navigations += 1
+            if self.navigations != 1 or _request_key(frame.url) != _request_key(self.document.url):
+                self.failure = Failure.NAVIGATION_REJECTED
+
+    async def identify_document(self, page: Any, **_kwargs: Any) -> Any:
+        # Native selector queries use Playwright's utility world. The retained
+        # handle binds later attachment checks to this DOM root.
+        self.root = await page.locator(":root").element_handle()
+        if self.root is None:
+            raise PublicError(Failure.NAVIGATION_REJECTED)
+        await self.attest_current()
+        return page
+
+    async def attest_current(self) -> str:
+        if self.failure:
+            raise PublicError(self.failure)
+        if not self.installed or not self.served or self.root is None:
+            raise PublicError(Failure.ENFORCEMENT_UNAVAILABLE)
+        if self.navigations != 1 or _request_key(self.page.url) != _request_key(self.document.url):
+            raise PublicError(Failure.NAVIGATION_REJECTED)
+        # A native selector scoped to the retained handle must still find that
+        # node directly under its Document. Detached/replaced roots do not match.
+        if await self.root.query_selector("xpath=self::*[parent::node()[not(self::*)]]") is None:
+            raise PublicError(Failure.NAVIGATION_REJECTED)
+        return self.page.url
 
     async def inspect(self, page: Any, **_kwargs: Any) -> Any:
         try:
-            if not await page.evaluate(CAPABILITY) or await page.context.cookies():
+            await self.attest_current()
+            if await page.context.cookies():
                 raise PublicError(Failure.ENFORCEMENT_UNAVAILABLE)
             self.checked = True
-        except Exception as exc:
-            self.failure = Failure.ENFORCEMENT_UNAVAILABLE
+        except PublicError as exc:
+            self.failure = self.failure or exc.failure
             raise PublicError(self.failure) from exc
+        except Exception as exc:
+            self.failure = self.failure or Failure.ENFORCEMENT_UNAVAILABLE
+            raise PublicError(self.failure) from exc
+        return page
+
+    async def capture(self, page: Any, html: str, **_kwargs: Any) -> Any:
+        if not self.checked:
+            self.failure = Failure.ENFORCEMENT_UNAVAILABLE
+            raise PublicError(self.failure)
+        await self.inspect(page)
+        self.captured = html
         return page
 
 
@@ -499,15 +653,16 @@ def _check_runtime() -> None:
 
 
 async def _render(
-    document: Document, broker: Broker, records: Records, deadline: float
-) -> tuple[str, str]:
+    document: Document, broker: Broker, records: Records, deadline: float, policy_path: Path
+) -> tuple[str, str, str]:
     from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
 
-    enforcement = Enforcement(broker, document)
+    enforcement = Enforcement(broker, document, policy_path, records)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as inert:
         inert.bind(("127.0.0.1", 0))
         proxy = f"http://127.0.0.1:{inert.getsockname()[1]}"
         config = BrowserConfig(
+            browser_type="firefox",
             headless=True,
             verbose=False,
             browser_mode="dedicated",
@@ -516,7 +671,7 @@ async def _render(
             storage_state=None,
             cookies=[],
             java_script_enabled=True,
-            light_mode=True,
+            light_mode=False,
             ignore_https_errors=False,
             text_mode=False,
             accept_downloads=False,
@@ -524,14 +679,18 @@ async def _render(
         )
         # Crawl4AI's decorator exposes a bound/unbound union to type checkers.
         crawler: Any = AsyncWebCrawler(config=config)
+        outcome: str = Failure.INTERNAL
+        records.emit(Stage.BROWSER, Event.START)
         try:
             async with asyncio.timeout_at(deadline):
                 strategy = getattr(crawler, "crawler_strategy", None)
                 if strategy is None or not callable(getattr(strategy, "set_hook", None)):
                     raise PublicError(Failure.ENFORCEMENT_UNAVAILABLE)
                 strategy.set_hook("on_page_context_created", enforcement.install)
+                strategy.set_hook("before_goto", enforcement.before_goto)
+                strategy.set_hook("after_goto", enforcement.identify_document)
                 strategy.set_hook("before_retrieve_html", enforcement.inspect)
-                records.emit("browser", "start")
+                strategy.set_hook("before_return_html", enforcement.capture)
                 try:
                     await crawler.start()
                 except Exception as exc:
@@ -545,18 +704,26 @@ async def _render(
                         remove_overlay_elements=False,
                         page_timeout=LIMITS.page_ms,
                         wait_until="domcontentloaded",
-                        delay_before_return_html=1.5,
+                        delay_before_return_html=LIMITS.render_delay_seconds,
                         word_count_threshold=1,
                         verbose=False,
                     ),
                 )
                 if enforcement.failure:
                     raise PublicError(enforcement.failure)
-                if not (enforcement.installed and enforcement.served and enforcement.checked):
+                if not (
+                    enforcement.installed
+                    and enforcement.served
+                    and enforcement.checked
+                    and enforcement.captured is not None
+                ):
                     raise PublicError(Failure.ENFORCEMENT_UNAVAILABLE)
+                await enforcement.attest_current()
                 if not result.success:
                     raise PublicError(Failure.RENDER_FAILED)
                 html = result.html or ""
+                if html != enforcement.captured:
+                    raise PublicError(Failure.ENFORCEMENT_UNAVAILABLE)
                 if len(html.encode("utf-8")) > LIMITS.html_bytes:
                     raise PublicError(Failure.TOO_LARGE)
                 markdown = result.markdown.raw_markdown if result.markdown else ""
@@ -565,10 +732,23 @@ async def _render(
                     raise PublicError(Failure.BOT_DETECTED)
                 if not markdown.strip():
                     raise PublicError(Failure.RENDER_FAILED)
-                records.emit("browser", "end", "ok")
-                return html, clean_markdown_content(markdown)[: LIMITS.markdown_chars]
+                captured_url = result.redirected_url or document.url
+                if _request_key(captured_url) != _request_key(document.url):
+                    raise PublicError(Failure.NAVIGATION_REJECTED)
+                outcome = "ok"
+                return html, clean_markdown_content(markdown)[: LIMITS.markdown_chars], captured_url
+        except PublicError as exc:
+            outcome = exc.failure
+            raise
+        except TimeoutError:
+            outcome = Failure.TIMEOUT
+            raise
+        except asyncio.CancelledError:
+            outcome = Failure.CANCELLED
+            raise
         finally:
-            records.emit("cleanup", "start")
+            records.emit(Stage.BROWSER, Event.END, outcome)
+            records.emit(Stage.CLEANUP, Event.START)
             deadline = time.monotonic() + LIMITS.cleanup_seconds
             close_error: BaseException | None = None
             try:
@@ -585,9 +765,9 @@ async def _render(
                 except BaseException as exc:
                     close_error = close_error or exc
             if close_error is not None:
-                records.emit("cleanup", "end", Failure.CLEANUP_FAILED)
+                records.emit(Stage.CLEANUP, Event.END, Failure.CLEANUP_FAILED)
                 raise PublicError(Failure.CLEANUP_FAILED) from close_error
-            records.emit("cleanup", "end", "ok")
+            records.emit(Stage.CLEANUP, Event.END, "ok")
 
 
 async def run_public_scrape(url: str, timeout: float, records: Records) -> PublicResult:
@@ -597,20 +777,35 @@ async def run_public_scrape(url: str, timeout: float, records: Records) -> Publi
             raise PublicError(Failure.INVALID_INPUT)
         deadline = asyncio.get_running_loop().time() + timeout
         _check_runtime()
-        with isolate_process(), _vendor_output():
+        with isolate_process() as root, _vendor_output():
+            policy_path = root / "firefox-policies.json"
+            policy_path.write_text(json.dumps(NATIVE_POLICY), encoding="utf-8")
+            os.environ["PLAYWRIGHT_FIREFOX_POLICIES_JSON"] = str(policy_path)
             broker = Broker()
             try:
                 async with asyncio.timeout_at(deadline):
-                    records.emit("fetch", "start")
-                    document = await broker.document(url)
-                    records.emit("fetch", "end", "ok")
-                html, markdown = await _render(document, broker, records, deadline)
+                    records.emit(Stage.FETCH, Event.START)
+                    try:
+                        document = await broker.document(url)
+                    except PublicError as exc:
+                        records.emit(Stage.FETCH, Event.END, exc.failure)
+                        raise
+                    except asyncio.CancelledError:
+                        records.emit(Stage.FETCH, Event.END, Failure.CANCELLED)
+                        raise
+                    except Exception:
+                        records.emit(Stage.FETCH, Event.END, Failure.INTERNAL)
+                        raise
+                    records.emit(Stage.FETCH, Event.END, "ok")
+                html, markdown, final_url = await _render(
+                    document, broker, records, deadline, policy_path
+                )
             finally:
                 records.counters(broker.requests, broker.bytes)
         result = PublicResult(
             ok=True,
             url=url,
-            final_url=document.url,
+            final_url=final_url,
             html=html,
             markdown=markdown,
             source="crawl4ai",
@@ -633,11 +828,14 @@ def cmd_public(args: Any) -> None:
     # through event-loop shutdown as well as during the crawl itself.
     logging.disable(logging.CRITICAL)
     records = Records(sys.stderr)
-    records.emit("public", "start")
+    records.emit(Stage.PUBLIC, Event.START)
     try:
         if args.stdin:
             try:
-                data = json.loads(sys.stdin.read(1_048_577))
+                raw = sys.stdin.read(LIMITS.stdin_chars + 1)
+                if len(raw) > LIMITS.stdin_chars:
+                    raise PublicError(Failure.INVALID_INPUT)
+                data = json.loads(raw)
             except (ValueError, UnicodeError) as exc:
                 raise PublicError(Failure.INVALID_INPUT) from exc
             if not isinstance(data, dict):
@@ -672,10 +870,7 @@ def cmd_public(args: Any) -> None:
         result = asyncio.run(run())
     except PublicError as exc:
         result = failure_result(exc.failure)
-    text = serialize(result)
-    # Serialization itself may exceed the cap even when the HTML does not.
-    if json.loads(text)["failure"] == Failure.TOO_LARGE:
-        result = failure_result(Failure.TOO_LARGE, result.elapsed_ms)
-    records.emit("public", "end", result.failure or "ok")
+    result, text = serialize(result)
+    records.emit(Stage.PUBLIC, Event.END, result.failure or "ok")
     print(text)
     raise SystemExit(exit_code(result))

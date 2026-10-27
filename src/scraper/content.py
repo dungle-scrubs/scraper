@@ -1,10 +1,6 @@
 """Pure content helpers shared by the configured and public CLI paths."""
 
-import contextlib
 import re
-import sys
-from collections.abc import Iterator
-from typing import Any
 
 BOT_DETECTION_PHRASES = (
     "performing security verification",
@@ -63,43 +59,6 @@ SCRAPE_ARTIFACT_LINE_SUBSTRINGS = (
     "You signed out in another tab or window.",
     "You switched accounts on another tab or window.",
 )
-
-
-# Depth-counted so concurrent crawls in one event loop don't corrupt sys.stdout:
-# only the outermost entry saves/restores the real stream (a naive save/restore
-# per call would capture another in-flight call's already-swapped stream).
-#
-# Atomicity note: the depth counter is mutated without a lock. This is safe in
-# practice because `crawl_url` is the only caller and it holds the body of this
-# context manager synchronously (no `await` between the depth change and the
-# `yield`). A truly interleaving re-entry across separate coroutines is not a
-# supported usage; if one is ever introduced, guard with a per-task structure
-# (e.g. contextvars) instead of a module-level counter.
-_stdout_suppress_depth = 0
-_stdout_real: Any = None
-
-
-@contextlib.contextmanager
-def _suppressed_stdout() -> Iterator[None]:
-    """Silence direct stdout writes (crawl4ai progress bars) — concurrency-safe.
-
-    Safe under nested re-entry from the same call stack (see the atomicity note
-    on the module-level counter above).
-
-    @returns: Context manager that routes stdout to stderr for its duration.
-    """
-    global _stdout_suppress_depth, _stdout_real
-    if _stdout_suppress_depth == 0:
-        _stdout_real = sys.stdout
-        sys.stdout = sys.stderr
-    _stdout_suppress_depth += 1
-    try:
-        yield
-    finally:
-        _stdout_suppress_depth -= 1
-        if _stdout_suppress_depth == 0:
-            sys.stdout = _stdout_real
-            _stdout_real = None
 
 
 def is_scrape_artifact_line(line: str) -> bool:
@@ -180,7 +139,7 @@ def looks_like_bot_block(markdown: str) -> bool:
 
     Detects two failure modes:
     1. Cloudflare/CAPTCHA challenge pages (short, contains bot-protection phrases).
-    2. Partial JS rendering — page structure loaded but dynamic data is missing,
+    2. Partial JS rendering - page structure loaded but dynamic data is missing,
        e.g. table rows with blank cells where content should be.
 
     @param markdown: Markdown from crawl4ai.

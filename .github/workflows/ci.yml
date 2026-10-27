@@ -31,8 +31,8 @@ jobs:
       - name: Type check
         run: uv run ty check
 
-      - name: Install test Chromium
-        run: uv run playwright install --with-deps chromium
+      - name: Install test browsers
+        run: uv run playwright install --with-deps chromium firefox
 
       - name: Test
         run: uv run pytest tests/ -v

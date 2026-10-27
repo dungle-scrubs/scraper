@@ -5,7 +5,7 @@ Get cleaned Markdown for the tools that collect your pages.
 Use the CLI, Python library or HTTP service to render pages with Crawl4AI,
 remove scraper artifacts and detect bot challenges. The CLI's `public` profile
 also returns rendered HTML and enforces an anonymous, public-address policy.
-For example, it rejects loopback targets before launching Chromium:
+For example, it rejects loopback targets before launching a browser:
 
 ```console
 $ scraper scrape --profile public http://127.0.0.1/
@@ -19,14 +19,15 @@ source checkout, which contains `pyproject.toml` and `uv.lock`:
 
 ```bash
 uv sync --frozen
-uv run --frozen playwright install chromium
+uv run --frozen playwright install chromium firefox
 uv run --frozen scraper scrape --help
 ```
 
 The checkout lock selects Crawl4AI 0.9.0 and Playwright 1.60.0. That Playwright
-installation supplies Chromium 148.0.7778.96. The public runtime guard rejects
-other versions with `enforcement_unavailable`. On Linux, use
-`uv run --frozen playwright install --with-deps chromium` for system dependencies.
+installation supplies Firefox 150.0.2 for the public profile and Chromium for
+the configured pipeline. The public runtime guard rejects other Firefox or SDK
+versions with `enforcement_unavailable`. On Linux, use
+`uv run --frozen playwright install --with-deps chromium firefox` for system dependencies.
 Scraping never downloads a browser. Use `uv run --frozen` before the CLI examples
 below to run this checkout's executable.
 
@@ -162,29 +163,46 @@ Host header and supplies the original HTTPS hostname through HTTPX's
 broker's destination to its validation result; it does not rely on a second
 hostname lookup at connection time. Redirect destinations undergo the same
 checks, with at most five hops. Subresource redirects are blocked, and no 3xx
-response is fulfilled to Chromium.
+response is fulfilled to the browser.
 
-The implementation requests offline mode and configures an exclusively bound
-loopback proxy socket that never listens or forwards traffic. The descriptor
-stays open through browser and driver cleanup. These settings do not establish
-that native browser networking honors the policy. Browser routing supplies HTTP
-responses from the broker.
-Only content type, content language and CORS origin response headers survive;
-Set-Cookie and active redirect or reporting headers do not.
+Public mode runs dedicated, nonpersistent Firefox online, behind an exclusively
+bound loopback proxy socket that never listens or forwards traffic. Playwright
+sets the Firefox browser proxy with an empty bypass list; localhost proxying is
+locked on. The socket stays open through browser and driver cleanup. Browser
+routes fulfill requests from the broker or abort them. The proxy refuses HTTP,
+HTTPS, and WebSocket connections that do not receive a routed response.
+Only content type, content language and the profile's CORS response headers
+survive; Set-Cookie and active redirect or reporting headers do not.
 
-Documents receive an opaque-origin CSP sandbox with scripts enabled. Cookie
-access is disabled before page scripts run. CSP, browser hooks and configuration
-restrict workers, frames, objects, popups, WebSockets, WebRTC and WebTransport.
-Required hook and JavaScript capability checks fail closed. These restrictions
-reduce page fidelity.
-A page can fail because a required script or other subresource cannot be fetched.
+After process isolation, the profile writes its own Firefox policy file before
+starting the driver. It locks off RTC, WebTransport, HTTP/3, DNS prefetch, link
+prefetch, the predictor, and speculative connections. The native Cookies policy
+rejects ordinary and private-browsing cookies. The pinned Playwright Firefox
+configuration also disables background connectivity checks and telemetry.
+An inherited policy path cannot select this file.
 
-This is not an airgap, an OS network sandbox or protection against a Chromium
-exploit. Native-network safety and security verification gaps remain blocking.
-The runtime guards and synthetic tests do not prove policy coverage for native
-browser traffic. Crawl4AI's vendor launch flags include `--no-sandbox` and
-`--ignore-certificate-errors`; the implementation does not remove them. The
-HTTPX broker owns TLS verification. No live-source acceptance is claimed.
+Before product navigation, a trusted secure document checks native RTC and
+WebTransport absence, response and script cookie rejection, the empty cookie
+jar, and actual WebSocket route closure. The whole owned policy file must match
+the required settings. A missing file, partial file, failed readiness check, or
+missing required hook returns `enforcement_unavailable`. These checks do not
+inspect every effective native preference or lock; those controls also rely on
+the pinned native policy implementation.
+
+Documents receive an opaque-origin CSP sandbox with scripts enabled. CSP
+restricts workers, Service Workers, frames, objects, and popups. WebSocket routes
+close connections. Capture retains a native DOM root handle and checks its
+attachment and main-frame navigation events before and after HTML retrieval.
+A replacement document, extra navigation, or changed result fails closed.
+These restrictions reduce page fidelity. A required subresource that cannot be
+fetched can fail the page.
+
+Synthetic CLI tests exercise these boundaries with an owned TCP listener and
+UDP receiver. They do not establish packet-level absence of all browser traffic,
+an OS sandbox, or protection against browser exploits. Crawl4AI's vendor launch
+arguments remain in place; HTTPX owns broker TLS verification. Independent
+security review and source-access clearance remain required before merge.
+No live-source acceptance is claimed.
 
 ### Public limits and lifecycle
 
@@ -242,7 +260,7 @@ before exposing the service beyond loopback. Jina sends the target URL to
 
 ```bash
 uv sync
-uv run playwright install --with-deps chromium
+uv run playwright install --with-deps chromium firefox
 uv run ruff format --check .
 uv run ruff check .
 uv run ty check
@@ -250,10 +268,10 @@ uv run pytest tests/ -v
 uv run --with pip-audit pip-audit --ignore-vuln PYSEC-2026-3740
 ```
 
-Tests use synthetic DNS and HTTP fixtures plus real Chromium and owned loopback
+Tests use synthetic DNS and HTTP fixtures plus real Firefox and owned loopback
 sentinels. They require the browser installation and do not skip if it is absent.
-No live content source or personal profile is required. CI installs Chromium on
-its disposable runner. The dependency audit ignores the documented, unresolved
+No live content source or personal profile is required. CI installs Firefox and
+Chromium on its disposable runner. The dependency audit ignores the documented, unresolved
 NLTK model-artifact advisory; the CLI does not accept model-artifact paths.
 
 For the existing container deployment, use `docker compose up -d`. Container
