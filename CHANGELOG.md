@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.2.2](https://github.com/dungle-scrubs/scraper/compare/v0.2.1...v0.2.2) (2026-10-27)
+
+
+### Added
+
+* add an isolated public CLI scrape profile ([#40](https://github.com/dungle-scrubs/scraper/issues/40)) ([e30b14f](https://github.com/dungle-scrubs/scraper/commit/e30b14f2aecbbe771e6b71092019cc81b104c476))
+
+
+### Fixed
+
+* enforce patched runtime dependency floors ([655c7e4](https://github.com/dungle-scrubs/scraper/commit/655c7e40e01e8dadf944a30b072629586599c265))
+* pin CI to the supported Ubuntu 24.04 runner ([#41](https://github.com/dungle-scrubs/scraper/issues/41)) ([ead154b](https://github.com/dungle-scrubs/scraper/commit/ead154b83db646db5ea8e6a0d792e13cf858c32a))
+
+
+### Maintenance
+
+* build and publish with uv, attest via attest-action ([#30](https://github.com/dungle-scrubs/scraper/issues/30)) ([4bc2aee](https://github.com/dungle-scrubs/scraper/commit/4bc2aeec638281e01021bdeefba4367075310ebc))
+
 ## [0.2.1](https://github.com/dungle-scrubs/scraper/compare/v0.2.0...v0.2.1) (2026-09-09)
 
 
