@@ -1,18 +1,29 @@
 """CLI entry point with stable JSON contract.
 
 Subcommands:
-  scrape  — scrape a URL and output JSON to stdout
-  serve   — start the HTTP server
+  scrape  scrape a URL and output JSON to stdout
+  serve   start the HTTP server
+
+The default profile uses the configured pipeline with optional Jina fallback.
+The CLI-only public profile returns rendered HTML and Markdown without Jina.
+Public failures use stable codes in both the failure and error fields.
 
 Exit codes:
-  0  success (content scraped)
-  1  scrape failed (all backends exhausted)
-  2  invalid input (bad URL, malformed stdin JSON)
-  3  timeout (global deadline exceeded)
-  4  internal error (unexpected crash)
+  0  content scraped
+  1  default: backends exhausted; public: redirect_rejected,
+     navigation_rejected, http_status, unsupported_content, unsupported_encoding,
+     too_large, bot_detected, render_failed, or cancelled
+  2  default: invalid input; public: invalid_input, url_rejected,
+     or credentials_in_url
+  3  default: global deadline; public: timeout, including per-target DNS
+     validation and the global deadline
+  4  default: unexpected crash; public: internal, enforcement_unavailable,
+     or cleanup_failed
 
-All logging goes to stderr.  stdout is exclusively for the JSON result.
+All logging goes to stderr. stdout is exclusively for the JSON result.
 """
+
+from __future__ import annotations
 
 import argparse
 import asyncio
@@ -20,9 +31,12 @@ import json
 import logging
 import sys
 from dataclasses import asdict
+from typing import TYPE_CHECKING
 
 from scraper.safety import UrlRejected, validate_url
-from scraper.scraper import ScrapeResult, scrape
+
+if TYPE_CHECKING:
+    from scraper.scraper import ScrapeResult
 
 # ── Exit codes ───────────────────────────────────────────────
 
@@ -112,6 +126,8 @@ async def _run_scrape(url: str, timeout: int) -> tuple[ScrapeResult, int]:
     @param timeout: Maximum wall-clock seconds for the entire pipeline.
     @returns: Tuple of (result, exit_code).
     """
+    from scraper.scraper import ScrapeResult, scrape
+
     try:
         result = await asyncio.wait_for(scrape(url), timeout=timeout)
     except TimeoutError:
@@ -132,6 +148,14 @@ def cmd_scrape(args: argparse.Namespace) -> None:
 
     @param args: Parsed CLI arguments.
     """
+    if args.profile == "public":
+        from scraper.public_profile import cmd_public
+
+        cmd_public(args)
+        return
+
+    from scraper.scraper import ScrapeResult
+
     # Resolve URL from --stdin or positional arg.
     url: str = _read_url_from_stdin() if args.stdin else args.url
     if not url:
@@ -188,7 +212,10 @@ def build_parser() -> argparse.ArgumentParser:
     """
     parser = argparse.ArgumentParser(
         prog="scraper",
-        description="Web scraper with anti-bot detection and Jina fallback.",
+        description=(
+            "Web scraper with bot detection. The default pipeline supports optional Jina "
+            "fallback; the CLI-only public profile returns HTML and Markdown without Jina."
+        ),
     )
     sub = parser.add_subparsers(dest="command")
 
@@ -207,6 +234,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--stdin",
         action="store_true",
         help='Read {"url": "..."} from stdin instead of a positional argument.',
+    )
+    scrape_p.add_argument(
+        "--profile",
+        choices=("default", "public"),
+        default="default",
+        help=(
+            "Scrape profile: default uses the configured pipeline with optional Jina; "
+            "public uses anonymous public/v1 rendering with HTML, Markdown, typed failures, "
+            "and no Jina (default: default)."
+        ),
     )
     scrape_p.add_argument(
         "--timeout",

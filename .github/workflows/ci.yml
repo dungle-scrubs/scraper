@@ -31,6 +31,9 @@ jobs:
       - name: Type check
         run: uv run ty check
 
+      - name: Install test browsers
+        run: uv run playwright install --with-deps firefox
+
       - name: Test
         run: uv run pytest tests/ -v
 

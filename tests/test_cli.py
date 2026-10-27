@@ -201,7 +201,7 @@ class TestBuildParser:
 class TestCmdScrape:
     """Integration tests for the scrape subcommand dispatch."""
 
-    @patch("scraper.cli.scrape", new_callable=AsyncMock)
+    @patch("scraper.scraper.scrape", new_callable=AsyncMock)
     def test_success_exit_0(
         self, mock_scrape: AsyncMock, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -223,7 +223,7 @@ class TestCmdScrape:
         assert output["ok"] is True
         assert output["markdown"] == "# Hello\n"
 
-    @patch("scraper.cli.scrape", new_callable=AsyncMock)
+    @patch("scraper.scraper.scrape", new_callable=AsyncMock)
     def test_scrape_failure_exit_1(
         self, mock_scrape: AsyncMock, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -263,7 +263,7 @@ class TestCmdScrape:
             cmd_scrape(args)
         assert exc_info.value.code == EXIT_INVALID_INPUT
 
-    @patch("scraper.cli.scrape", new_callable=AsyncMock)
+    @patch("scraper.scraper.scrape", new_callable=AsyncMock)
     def test_timeout_exit_3(
         self, mock_scrape: AsyncMock, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -279,7 +279,7 @@ class TestCmdScrape:
         assert output["ok"] is False
         assert "timeout" in output["error"].lower()
 
-    @patch("scraper.cli.scrape", new_callable=AsyncMock)
+    @patch("scraper.scraper.scrape", new_callable=AsyncMock)
     def test_internal_error_exit_4(
         self, mock_scrape: AsyncMock, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -295,7 +295,7 @@ class TestCmdScrape:
         assert output["ok"] is False
         assert "kaboom" in output["error"]
 
-    @patch("scraper.cli.scrape", new_callable=AsyncMock)
+    @patch("scraper.scraper.scrape", new_callable=AsyncMock)
     def test_stdin_mode(
         self,
         mock_scrape: AsyncMock,
