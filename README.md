@@ -171,6 +171,8 @@ sets the Firefox browser proxy with an empty bypass list; localhost proxying is
 locked on. The socket stays open through browser and driver cleanup. Browser
 routes fulfill requests from the broker or abort them. The proxy refuses HTTP,
 HTTPS, and WebSocket connections that do not receive a routed response.
+Proxy confinement relies on the pinned browser source and bounded synthetic
+observations. Runtime readiness does not observe every native traffic channel.
 Only content type, content language and the profile's CORS response headers
 survive; Set-Cookie and active redirect or reporting headers do not.
 
@@ -179,7 +181,10 @@ starting the driver. It locks off RTC, WebTransport, HTTP/3, DNS prefetch, link
 prefetch, the predictor, and speculative connections. The native Cookies policy
 rejects ordinary and private-browsing cookies. The pinned Playwright Firefox
 configuration also disables background connectivity checks and telemetry.
-An inherited policy path cannot select this file.
+An inherited policy path cannot select this file. Higher-priority Linux system
+or distribution policies and macOS or Windows enterprise policies may override
+the owned file. The supported profile assumes an unmanaged, trusted browser and
+host.
 
 Before product navigation, a trusted secure document checks native RTC and
 WebTransport absence, response and script cookie rejection, the empty cookie
@@ -187,13 +192,16 @@ jar, and actual WebSocket route closure. The whole owned policy file must match
 the required settings. A missing file, partial file, failed readiness check, or
 missing required hook returns `enforcement_unavailable`. These checks do not
 inspect every effective native preference or lock; those controls also rely on
-the pinned native policy implementation.
+the pinned native policy implementation on that supported host. Readiness
+observes only the effects listed above, not every effective preference or lock.
 
 Documents receive an opaque-origin CSP sandbox with scripts enabled. CSP
 restricts workers, Service Workers, frames, objects, and popups. WebSocket routes
 close connections. Capture retains a native DOM root handle and checks its
 attachment and main-frame navigation events before and after HTML retrieval.
 A replacement document, extra navigation, or changed result fails closed.
+Capture also rejects same-document hash, history, path, or query changes.
+These strict URL checks may reject single-page applications.
 These restrictions reduce page fidelity. A required subresource that cannot be
 fetched can fail the page.
 
@@ -233,7 +241,9 @@ CLI exits.
 Public stderr contains JSON stage records with a correlation ID, elapsed time,
 event and typed outcome. Vendor output is suppressed. Records contain no URLs,
 headers, page bodies or environment values. Callers can retain stderr to identify
-the last stage reached and the cleanup outcome.
+the last stage reached and the cleanup outcome. An enclosing deadline can
+cancel an inner stage, which records `cancelled`; the final public end record
+and result report `timeout`.
 
 ### Configured pipeline and service settings
 
@@ -260,7 +270,7 @@ before exposing the service beyond loopback. Jina sends the target URL to
 
 ```bash
 uv sync
-uv run playwright install --with-deps chromium firefox
+uv run playwright install --with-deps firefox
 uv run ruff format --check .
 uv run ruff check .
 uv run ty check
@@ -270,8 +280,8 @@ uv run --with pip-audit pip-audit --ignore-vuln PYSEC-2026-3740
 
 Tests use synthetic DNS and HTTP fixtures plus real Firefox and owned loopback
 sentinels. They require the browser installation and do not skip if it is absent.
-No live content source or personal profile is required. CI installs Firefox and
-Chromium on its disposable runner. The dependency audit ignores the documented, unresolved
+No live content source or personal profile is required. CI installs Firefox on
+its disposable runner. The dependency audit ignores the documented, unresolved
 NLTK model-artifact advisory; the CLI does not accept model-artifact paths.
 
 For the existing container deployment, use `docker compose up -d`. Container

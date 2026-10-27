@@ -106,19 +106,11 @@ def run_cli(tmp_path, *args, bootstrap=BOOTSTRAP, extra_env=None, stdin=None):
     return completed, boundary
 
 
-def test_public_cli_uses_native_firefox_for_javascript_output(tmp_path):
-    completed, boundary = run_cli(tmp_path, "https://fixture.test/index")
-    assert completed.returncode == 0, (completed.stderr, boundary)
-    result = json.loads(completed.stdout)
-    assert ARTICLE in result["markdown"] and f"<p>{ARTICLE}</p>" in result["html"]
-    assert boundary["engines"] == ["firefox"]
-    assert boundary["counts"] == {"tcp": 0, "udp": 0}
-
-
 def test_public_cli_returns_javascript_article_html_and_markdown(tmp_path):
     completed, boundary = run_cli(tmp_path, "https://fixture.test/index")
     assert completed.returncode == 0, completed.stderr
     result = json.loads(completed.stdout)
+    assert boundary["counts"] == {"tcp": 0, "udp": 0}
     assert result["profile"] == "public/v1"
     assert result["ok"] is True and result["failure"] is None
     assert ARTICLE in result["markdown"]
@@ -372,6 +364,60 @@ def test_wall_timeout_includes_a_resolver_that_does_not_return(tmp_path):
     assert boundary["requests"] == []
 
 
+@pytest.mark.parametrize(
+    "size,failure", [(1_048_576, "url_rejected"), (1_048_577, "invalid_input")]
+)
+def test_public_stdin_size_boundary(tmp_path, size, failure):
+    payload = '{"url":"http://127.0.0.1/"}'
+    completed, boundary = run_cli(tmp_path, "--stdin", stdin=payload + " " * (size - len(payload)))
+    assert completed.returncode == 2, completed.stderr
+    result = json.loads(completed.stdout)
+    assert result["failure"] == failure
+    assert not result["html"] and not result["markdown"]
+    assert boundary["requests"] == [] and boundary["navigations"] == []
+    assert boundary["engines"] == []
+
+
+def test_actual_browser_version_mismatch_fails_before_product_navigation(tmp_path):
+    url = "https://fixture.test/fault-browser-version"
+    completed, boundary = run_cli(tmp_path, url)
+    assert completed.returncode == 4, completed.stderr
+    assert json.loads(completed.stdout)["failure"] == "enforcement_unavailable"
+    assert boundary["engines"] == ["firefox"]
+    assert boundary["navigations"] == []
+    assert len(boundary["requests"]) == 1
+
+
+def test_retained_root_replacement_without_navigation_is_rejected(tmp_path):
+    url = "https://fixture.test/fault-root-replacement"
+    completed, boundary = run_cli(tmp_path, url)
+    assert completed.returncode == 1, completed.stderr
+    result = json.loads(completed.stdout)
+    assert result["failure"] == "navigation_rejected"
+    assert not result["html"] and not result["markdown"]
+    assert boundary["root_replacement"] == {"url": url, "article": ARTICLE, "detached": True}
+    assert [n["url"] for n in boundary["navigations"]] == [
+        "https://public-profile.invalid/readiness",
+        url,
+    ]
+    assert boundary["counts"] == {"tcp": 0, "udp": 0}
+
+
+def test_same_document_hash_mutation_is_rejected(tmp_path):
+    url = "https://fixture.test/fault-same-document"
+    completed, boundary = run_cli(tmp_path, url)
+    assert completed.returncode == 1, completed.stderr
+    result = json.loads(completed.stdout)
+    assert result["failure"] == "navigation_rejected"
+    assert not result["html"] and not result["markdown"]
+    assert boundary["same_document_url"] == url + "#synthetic"
+    assert [n["url"] for n in boundary["navigations"]] == [
+        "https://public-profile.invalid/readiness",
+        url,
+    ]
+    assert boundary["counts"] == {"tcp": 0, "udp": 0}
+
+
 def test_same_url_document_replacement_during_capture_is_rejected(tmp_path):
     completed, boundary = run_cli(tmp_path, "https://fixture.test/replace-document")
     assert completed.returncode == 1, completed.stderr
@@ -536,6 +582,13 @@ def test_missing_or_partial_native_policy_fails_before_product_navigation(tmp_pa
     assert all(nav["url"] != url for nav in boundary["navigations"])
     assert len(boundary["requests"]) == 1  # Only the validated document prefetch.
     assert boundary["counts"] == {"tcp": 0, "udp": 0}
+    events = [json.loads(line) for line in completed.stderr.splitlines()]
+    enforcement = [e for e in events if e["stage"] == "enforcement"]
+    assert [(e["event"], e["outcome"]) for e in enforcement] == [
+        ("start", "pending"),
+        ("end", "enforcement_unavailable"),
+    ]
+    assert {e["id"] for e in enforcement} == {events[0]["id"]}
 
 
 def test_readiness_failure_records_the_trusted_stage_and_cleanup(tmp_path):
@@ -555,11 +608,6 @@ def test_readiness_failure_records_the_trusted_stage_and_cleanup(tmp_path):
         nav["url"] != "https://fixture.test/fault-policy-ignored" for nav in boundary["navigations"]
     )
 
-
-def test_native_readiness_refuses_an_unconsumed_policy_before_product_navigation(tmp_path):
-    url = "https://fixture.test/fault-policy-ignored"
-    completed, boundary = run_cli(tmp_path, url)
-    assert completed.returncode == 4, completed.stderr
     assert json.loads(completed.stdout)["failure"] == "enforcement_unavailable"
     assert [nav["url"] for nav in boundary["navigations"]] == [
         "https://public-profile.invalid/readiness"

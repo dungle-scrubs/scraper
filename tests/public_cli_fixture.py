@@ -28,6 +28,8 @@ CONTROL = None
 ENCODED_STREAM_READ = False
 ENGINES = set()
 NATIVE_JARS = []
+ROOT_REPLACEMENT = None
+SAME_DOCUMENT_URL = None
 NAVIGATIONS = []
 STOP = threading.Event()
 TCP = socket.socket()
@@ -110,6 +112,8 @@ def record():
                 "engines": sorted(ENGINES),
                 "navigations": NAVIGATIONS,
                 "native_jars": NATIVE_JARS,
+                "root_replacement": ROOT_REPLACEMENT,
+                "same_document_url": SAME_DOCUMENT_URL,
                 "observed_processes": len(PROCESSES),
             }
         )
@@ -320,8 +324,6 @@ async def respond(request):
     if path.endswith(".json"):
         headers["content-type"] = "application/json"
         body = json.dumps({"article": ARTICLE})
-    if path == "/slow-close":
-        await asyncio.sleep(12)
     if path == "/policy":
         head = "".join(f'<link rel="{rel}" href="{TCP_URL}/{rel}">' for rel in ("preconnect",))
         body = body.replace("</head>", head + "</head>").replace(
@@ -436,14 +438,51 @@ if any(url in ARGS for url in HOOK_FAULTS):
 if "https://fixture.test/slow-close" in ARGS:
     from playwright.async_api import Browser
 
+    original_content = Page.content
     original_close = Browser.close
+
+    async def wait_for_cleanup_window(self, *args, **kwargs):
+        if self.url == "https://fixture.test/slow-close":
+            await asyncio.sleep(max(0, 15 - (time.monotonic() - CLI_STARTED)))
+        return await original_content(self, *args, **kwargs)
 
     async def slow_close(self, *args, **kwargs):
         # Finish just after the 20s operation deadline, within cleanup's grace.
         await asyncio.sleep(max(0, 21 - (time.monotonic() - CLI_STARTED)))
         await original_close(self, *args, **kwargs)
 
+    patch.object(Page, "content", wait_for_cleanup_window).start()
     patch.object(Browser, "close", slow_close).start()
+
+if "https://fixture.test/fault-browser-version" in ARGS:
+    from playwright.async_api import Browser
+
+    patch.object(Browser, "version", property(lambda _self: "150.0.3")).start()
+
+if any(
+    url in ARGS
+    for url in (
+        "https://fixture.test/fault-root-replacement",
+        "https://fixture.test/fault-same-document",
+    )
+):
+    original_content = Page.content
+
+    async def mutate_document_before_content(self, *args, **kwargs):
+        global ROOT_REPLACEMENT, SAME_DOCUMENT_URL
+        if self.url == "https://fixture.test/fault-root-replacement" and ROOT_REPLACEMENT is None:
+            ROOT_REPLACEMENT = await self.evaluate("""() => {
+                const old = document.documentElement;
+                const replacement = old.cloneNode(true);
+                old.replaceWith(replacement);
+                return {url: location.href, article: document.querySelector('article p').textContent,
+                        detached: !old.isConnected};
+            }""")
+        elif self.url == "https://fixture.test/fault-same-document":
+            SAME_DOCUMENT_URL = await self.evaluate("location.hash = 'synthetic'; location.href")
+        return await original_content(self, *args, **kwargs)
+
+    patch.object(Page, "content", mutate_document_before_content).start()
 
 if "https://fixture.test/fault-capture-navigation" in ARGS:
     page_content = Page.content

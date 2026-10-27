@@ -24,7 +24,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, Literal, TextIO
 from urllib.parse import urljoin, urlsplit
 
 import httpx
@@ -132,7 +132,7 @@ def failure_result(failure: Failure, elapsed_ms: float = 0) -> PublicResult:
 
 def serialize(result: PublicResult) -> tuple[PublicResult, str]:
     text = json.dumps(asdict(result), ensure_ascii=True)
-    if len(text) + 1 > LIMITS.json_bytes:
+    if len(text.encode("utf-8")) + 1 > LIMITS.json_bytes:
         result = failure_result(Failure.TOO_LARGE, result.elapsed_ms)
         text = json.dumps(asdict(result), ensure_ascii=True)
     return result, text
@@ -169,22 +169,22 @@ class Event(StrEnum):
     COUNTERS = "counters"
 
 
+type Outcome = Failure | Literal["ok", "pending"]
+
+
 class Records:
     def __init__(self, stream: TextIO):
         self.stream = stream
         self.id = uuid.uuid4().hex
-        self.stage = Stage.PUBLIC
         self.started = time.monotonic()
 
     def write(
         self,
         stage: Stage,
         event: Event,
-        outcome: str | None = None,
-        requests: int | None = None,
-        body_bytes: int | None = None,
+        outcome: Outcome | None = None,
+        counters: tuple[int, int] | None = None,
     ) -> None:
-        self.stage = stage
         payload: dict[str, Any] = {
             "profile": PROFILE_ID,
             "id": self.id,
@@ -194,16 +194,15 @@ class Records:
         }
         if outcome is not None:
             payload["outcome"] = outcome
-        if requests is not None:
-            payload["requests"] = requests
-            payload["body_bytes"] = body_bytes
+        if counters is not None:
+            payload["requests"], payload["body_bytes"] = counters
         print(json.dumps(payload), file=self.stream, flush=True)
 
     def counters(self, requests: int, body_bytes: int) -> None:
         if DEBUG:
-            self.write(Stage.BROKER, Event.COUNTERS, requests=requests, body_bytes=body_bytes)
+            self.write(Stage.BROKER, Event.COUNTERS, counters=(requests, body_bytes))
 
-    def emit(self, stage: Stage, event: Event, outcome: str = "pending") -> None:
+    def emit(self, stage: Stage, event: Event, outcome: Outcome = "pending") -> None:
         self.write(stage, event, outcome)
 
 
@@ -519,10 +518,11 @@ class Enforcement:
 
             await trusted.route("**/*", readiness_route)
             await trusted.goto(READINESS_URL, wait_until="load")
-            ready = await trusted.evaluate("""async () => {
+            ready = await trusted.evaluate(
+                """async (readinessWs) => {
                 document.cookie='readiness_script=synthetic; Secure; SameSite=None';
                 const closed = await new Promise(resolve => {
-                    const ws = new WebSocket('wss://public-profile.invalid/readiness');
+                    const ws = new WebSocket(readinessWs);
                     ws.onclose=()=>resolve(true);
                     ws.onerror=()=>{};
                     setTimeout(()=>resolve(false),1000);
@@ -535,7 +535,9 @@ class Enforcement:
                     cookies: document.cookie,
                     closed
                 };
-            }""")
+            }""",
+                READINESS_WS,
+            )
             if (
                 ready
                 != {
@@ -679,7 +681,7 @@ async def _render(
         )
         # Crawl4AI's decorator exposes a bound/unbound union to type checkers.
         crawler: Any = AsyncWebCrawler(config=config)
-        outcome: str = Failure.INTERNAL
+        outcome: Outcome = Failure.INTERNAL
         records.emit(Stage.BROWSER, Event.START)
         try:
             async with asyncio.timeout_at(deadline):

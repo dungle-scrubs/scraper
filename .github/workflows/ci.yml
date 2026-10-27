@@ -32,7 +32,7 @@ jobs:
         run: uv run ty check
 
       - name: Install test browsers
-        run: uv run playwright install --with-deps chromium firefox
+        run: uv run playwright install --with-deps firefox
 
       - name: Test
         run: uv run pytest tests/ -v
