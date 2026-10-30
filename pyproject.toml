@@ -43,7 +43,7 @@ dependencies = [
     "pydantic-settings>=2.14.2",
     # Security floor: beautifulsoup4 allows soupsieve<2.9.0 (PYSEC-2026-4170).
     # Fixed in 2.9.0 (scraper#38).
-    "soupsieve>=2.9.0",
+    "soupsieve>=3.0.4",
     # Security floor: fastapi only requires starlette>=0.46, which allows the
     # CVE-2026-54282 (request.url.hostname poisoning) range <1.3.0.
     "starlette>=1.3.0",
