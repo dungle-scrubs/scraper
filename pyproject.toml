@@ -65,7 +65,7 @@ scraper = "scraper.cli:main"
 
 [dependency-groups]
 dev = [
-    "packaging>=26.2",
+    "packaging>=26.3",
     "psutil==7.2.2",
     "pytest>=9.0.3",
     "pytest-asyncio>=1.4.0",
