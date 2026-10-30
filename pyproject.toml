@@ -24,7 +24,7 @@ dependencies = [
     # Security floor: huggingface-hub, via tokenizers, allows filelock<4.2.1
     # (CVE-2026-112940). Fixed in 4.2.1 (scraper#38).
     "filelock>=4.2.1",
-    "httpx>=0.27.0",
+    "httpx>=0.28.1",
     # Pinned at the runtime layer (not just the uv override) so published-wheel
     # consumers also get the patched lxml line, since crawl4ai pins lxml~=5.3.
     "lxml>=6.1.1",
