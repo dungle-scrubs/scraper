@@ -348,6 +348,10 @@ async def respond(request):
         body = body.replace(
             SCRIPT, "setTimeout(()=>location.href='https://other.test/new-document',100);" + SCRIPT
         )
+    elif path == "/history-same-url":
+        body = body.replace(SCRIPT, "history.replaceState(null,'',location.href);" + SCRIPT)
+    elif path == "/history-other-url":
+        body = body.replace(SCRIPT, "history.replaceState(null,'','/elsewhere');" + SCRIPT)
     elif path == "/cors":
         body = body.replace("</body>", '<script type="module" src="/module.js"></script></body>')
     elif path == "/module.js":

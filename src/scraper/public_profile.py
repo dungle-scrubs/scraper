@@ -441,6 +441,7 @@ class Enforcement:
         self.page: Any = None
         self.root: Any = None
         self.navigations = 0
+        self.committed_url: str | None = None
         self.captured: str | None = None
         self.readiness_ws = False
 
@@ -597,7 +598,15 @@ class Enforcement:
     def navigated(self, frame: Any) -> None:
         if frame == self.page.main_frame:
             self.navigations += 1
-            if self.navigations != 1 or _request_key(frame.url) != _request_key(self.document.url):
+            if self.navigations == 1:
+                if _request_key(frame.url) != _request_key(self.document.url):
+                    self.failure = Failure.NAVIGATION_REJECTED
+                self.committed_url = frame.url
+            # A later event is accepted only at the exact committed URL: a history
+            # update that leaves the URL unchanged. Any new document arrives as a
+            # navigation request, which route() rejects, and a replaced root fails
+            # the retained-handle check in attest_current().
+            elif frame.url != self.committed_url:
                 self.failure = Failure.NAVIGATION_REJECTED
 
     async def identify_document(self, page: Any, **_kwargs: Any) -> Any:
@@ -614,7 +623,11 @@ class Enforcement:
             raise PublicError(self.failure)
         if not self.installed or not self.served or self.root is None:
             raise PublicError(Failure.ENFORCEMENT_UNAVAILABLE)
-        if self.navigations != 1 or _request_key(self.page.url) != _request_key(self.document.url):
+        if (
+            self.navigations < 1
+            or self.page.url != self.committed_url
+            or _request_key(self.page.url) != _request_key(self.document.url)
+        ):
             raise PublicError(Failure.NAVIGATION_REJECTED)
         # A native selector scoped to the retained handle must still find that
         # node directly under its Document. Detached/replaced roots do not match.

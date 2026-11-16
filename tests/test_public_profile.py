@@ -558,6 +558,24 @@ def test_public_document_navigation_fails_before_fetching_a_differently_labelled
     assert not any(r["url"].endswith("/new-document") for r in boundary["requests"])
 
 
+def test_history_update_that_keeps_the_url_is_accepted(tmp_path):
+    completed, boundary = run_cli(tmp_path, "https://fixture.test/history-same-url")
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout)
+    assert result["ok"] is True and result["failure"] is None
+    assert ARTICLE in result["markdown"]
+    assert result["final_url"] == "https://fixture.test/history-same-url"
+    assert boundary["counts"] == {"tcp": 0, "udp": 0}
+
+
+def test_history_update_that_changes_the_url_is_rejected(tmp_path):
+    completed, boundary = run_cli(tmp_path, "https://fixture.test/history-other-url")
+    assert completed.returncode == 1, completed.stderr
+    result = json.loads(completed.stdout)
+    assert result["failure"] == "navigation_rejected" and not result["html"]
+    assert boundary["counts"] == {"tcp": 0, "udp": 0}
+
+
 @pytest.mark.parametrize(
     "fault",
     [
