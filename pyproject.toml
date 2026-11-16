@@ -41,7 +41,7 @@ dependencies = [
     "pillow>=13.0.0",
     "playwright>=1.60.0",
     "pydantic>=2.13.4",
-    "pydantic-settings>=2.14.2",
+    "pydantic-settings>=2.16.2",
     # Security floor: beautifulsoup4 allows soupsieve<2.9.0 (PYSEC-2026-4170).
     # Fixed in 2.9.0 (scraper#38). 2.9 has CVE-2026-126190, -126192 and
     # -126193; the last fix is only in 4.0.0.
