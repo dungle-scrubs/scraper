@@ -169,11 +169,11 @@ def test_native_policy_cookie_authorization_and_csp_at_actual_browser_boundary(t
     assert completed.returncode == 0, completed.stderr
     html = json.loads(completed.stdout)["html"]
     for expected in (
-        "cookie=SecurityError",
+        "cookie=silent",
         "RTCPeerConnection=undefined",
         "webkitRTCPeerConnection=undefined",
         "WebTransport=undefined",
-        "storage=SecurityError",
+        "storage=memory",
         "worker=blocked",
         "worker-csp=blocked",
         "sw=SecurityError",
@@ -540,6 +540,49 @@ def test_per_target_dns_timeout_is_typed_as_timeout(tmp_path):
     assert completed.returncode == 3, completed.stderr
     assert json.loads(completed.stdout)["failure"] == "timeout"
     assert boundary["requests"] == []
+
+
+def _storage_bootstrap():
+    from tests.public_cli_fixture_storage import STORAGE_CONST, STORAGE_ROUTES
+
+    text = BOOTSTRAP.replace('SCRIPT = """', STORAGE_CONST + 'SCRIPT = """', 1)
+    return text.replace('    elif path == "/bot":', STORAGE_ROUTES + '    elif path == "/bot":', 1)
+
+
+def test_sandboxed_pages_get_memory_only_storage_and_render(tmp_path):
+    completed, boundary = run_cli(
+        tmp_path, "https://fixture.test/storage-app", bootstrap=_storage_bootstrap()
+    )
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout)
+    assert result["ok"] is True and result["failure"] is None
+    marker = "storage fresh name=present session=present cookieEmpty=true"
+    assert f'<p id="storage">{marker}</p>' in result["html"]
+    assert marker in result["markdown"]
+    assert boundary["counts"] == {"tcp": 0, "udp": 0}
+
+
+def test_memory_storage_does_not_persist_across_reads(tmp_path):
+    for read in range(2):
+        completed, _boundary = run_cli(
+            tmp_path, "https://fixture.test/storage-app", bootstrap=_storage_bootstrap()
+        )
+        assert completed.returncode == 0, completed.stderr
+        # A second invocation must start empty, not see the first read's data.
+        assert "storage fresh name=present" in json.loads(completed.stdout)["markdown"], read
+
+
+def test_undecodable_subresource_is_dropped_alone_without_failing_the_read(tmp_path):
+    completed, boundary = run_cli(
+        tmp_path, "https://fixture.test/encoded-asset", bootstrap=_storage_bootstrap()
+    )
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout)
+    assert result["ok"] is True and result["failure"] is None
+    assert ARTICLE in result["markdown"]
+    assert any(r["url"].endswith("/gzipped.js") for r in boundary["requests"])
+    assert all(r["headers"]["accept-encoding"] == "identity" for r in boundary["requests"])
+    assert boundary["counts"] == {"tcp": 0, "udp": 0}
 
 
 def test_unexpected_encoding_is_rejected_before_reading_or_decoding_the_body(tmp_path):

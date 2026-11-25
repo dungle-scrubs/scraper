@@ -126,8 +126,10 @@ and `error` contain the same stable code. There is one attempt and no fallback.
 
 The table lists every public failure code. Errors never include upstream
 exception text or a rejected URL. A failed subresource fetch fails the whole
-page with empty content fields. Public mode does not return best-effort success
-with partial content after a subresource failure.
+page with empty content fields, with one exception: a subresource whose
+response carries a content encoding the broker cannot decode is dropped alone,
+and the page renders without that asset. Public mode does not return
+best-effort success with partial content after any other subresource failure.
 
 ### Public profile isolation
 
@@ -197,7 +199,14 @@ observes only the effects listed above, not every effective preference or lock.
 
 Documents receive an opaque-origin CSP sandbox with scripts enabled. CSP
 restricts workers, Service Workers, frames, objects, and popups. WebSocket routes
-close connections. Capture retains a native DOM root handle and checks its
+close connections. On an opaque origin the native `localStorage`,
+`sessionStorage` and `document.cookie` accessors throw `SecurityError`, which
+crashes script-heavy pages that read them at startup, so every document gets an
+injected init script defining `localStorage` and `sessionStorage` as
+per-document in-memory storage and a `document.cookie` that reads empty and
+discards writes. Nothing persists between documents or invocations, nothing
+leaves the page, and the sandbox and cookie policy are unchanged.
+Capture retains a native DOM root handle and checks its
 attachment and main-frame navigation events before and after HTML retrieval.
 A replacement document, extra navigation, or changed result fails closed.
 Capture also rejects same-document hash, history, path, or query changes.

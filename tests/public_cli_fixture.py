@@ -248,12 +248,12 @@ fetch('/article.json').then(r=>r.json()).then(d=>{
 });"""
 POLICY = """(async()=>{
  const report=[];
- try{document.cookie='script=synthetic; Secure; SameSite=None';report.push('cookie='+document.cookie)}
+ try{document.cookie='script=synthetic; Secure; SameSite=None';report.push('cookie='+(document.cookie===''?'silent':'unexpected'))}
  catch(e){report.push('cookie='+e.name)}
  for(const key of ['RTCPeerConnection','webkitRTCPeerConnection','WebTransport']) {
    report.push(key+'='+typeof window[key]);
  }
- try{localStorage.setItem('probe','synthetic');report.push('storage=unexpected')}catch(e){report.push('storage='+e.name)}
+ try{localStorage.setItem('probe','synthetic');report.push('storage='+(localStorage.getItem('probe')==='synthetic'?'memory':'unexpected'))}catch(e){report.push('storage='+e.name)}
  document.addEventListener('securitypolicyviolation',e=>{
    if(e.violatedDirective==='worker-src')report.push('worker-csp=blocked');
  });
