@@ -132,7 +132,8 @@ class Failure(StrEnum):
 
 class PublicError(Exception):
     def __init__(self, failure: Failure):
-        import sys as _s, traceback as _t
+        import sys as _s
+        import traceback as _t
 
         if "ENFORCEMENT_UNAVAILABLE" in repr(failure) or "enforcement_unavailable" in str(failure):
             _s.stderr.write(
@@ -470,7 +471,8 @@ def _request_key(url: str) -> tuple[str, bytes, int | None, bytes]:
 class Enforcement:
     def __setattr__(self, name, value):
         if name == "failure" and value is not None and "enforcement_unavailable" in str(value):
-            import sys as _s, traceback as _t
+            import sys as _s
+            import traceback as _t
 
             _s.stderr.write(
                 "DBG set "
