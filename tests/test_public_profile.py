@@ -542,8 +542,17 @@ def test_per_target_dns_timeout_is_typed_as_timeout(tmp_path):
     assert boundary["requests"] == []
 
 
+def _storage_bootstrap():
+    from tests.public_cli_fixture_storage import STORAGE_CONST, STORAGE_ROUTES
+
+    text = BOOTSTRAP.replace('SCRIPT = """', STORAGE_CONST + 'SCRIPT = """', 1)
+    return text.replace('    elif path == "/bot":', STORAGE_ROUTES + '    elif path == "/bot":', 1)
+
+
 def test_sandboxed_pages_get_memory_only_storage_and_render(tmp_path):
-    completed, boundary = run_cli(tmp_path, "https://fixture.test/storage-app")
+    completed, boundary = run_cli(
+        tmp_path, "https://fixture.test/storage-app", bootstrap=_storage_bootstrap()
+    )
     assert completed.returncode == 0, completed.stderr
     result = json.loads(completed.stdout)
     assert result["ok"] is True and result["failure"] is None
@@ -555,14 +564,18 @@ def test_sandboxed_pages_get_memory_only_storage_and_render(tmp_path):
 
 def test_memory_storage_does_not_persist_across_reads(tmp_path):
     for read in range(2):
-        completed, _boundary = run_cli(tmp_path, "https://fixture.test/storage-app")
+        completed, _boundary = run_cli(
+            tmp_path, "https://fixture.test/storage-app", bootstrap=_storage_bootstrap()
+        )
         assert completed.returncode == 0, completed.stderr
         # A second invocation must start empty, not see the first read's data.
         assert "storage fresh name=present" in json.loads(completed.stdout)["markdown"], read
 
 
 def test_undecodable_subresource_is_dropped_alone_without_failing_the_read(tmp_path):
-    completed, boundary = run_cli(tmp_path, "https://fixture.test/encoded-asset")
+    completed, boundary = run_cli(
+        tmp_path, "https://fixture.test/encoded-asset", bootstrap=_storage_bootstrap()
+    )
     assert completed.returncode == 0, completed.stderr
     result = json.loads(completed.stdout)
     assert result["ok"] is True and result["failure"] is None
