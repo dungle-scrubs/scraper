@@ -35,6 +35,8 @@ from scraper.safety import UrlRejected, ValidatedTarget, _format_netloc, validat
 
 PROFILE_ID = "public/v1"
 DEBUG = False
+# Leave time for navigation and capture after dropping a stalled asset.
+SUBRESOURCE_BODY_SECONDS = 5.0
 CSP = "sandbox allow-scripts; worker-src 'none'; frame-src 'none'; child-src 'none'; object-src 'none'"
 # The sandbox CSP keeps every product document on an opaque origin, where the
 # native window.localStorage, window.sessionStorage and document.cookie
@@ -307,6 +309,10 @@ def _open_transport() -> httpx.AsyncBaseTransport:
     return httpx.AsyncHTTPTransport(verify=True)
 
 
+class SubresourceBodyTimeout(TimeoutError):
+    """A subresource exceeded its total body-read deadline."""
+
+
 @dataclass(frozen=True)
 class Document:
     url: str
@@ -316,7 +322,8 @@ class Document:
 
 
 class Broker:
-    def __init__(self):
+    def __init__(self, deadline: float):
+        self.deadline = deadline
         self.requests = 0
         self.bytes = 0
         self.resolvers = asyncio.Semaphore(LIMITS.resolver_workers)
@@ -358,7 +365,7 @@ class Broker:
         if self.requests > LIMITS.requests:
             raise PublicError(Failure.TOO_LARGE)
 
-    async def fetch(self, url: str, method: str = "GET") -> Document:
+    async def fetch(self, url: str, method: str = "GET", *, subresource: bool = False) -> Document:
         self.count_attempt()
         if method not in ("GET", "HEAD"):
             raise PublicError(Failure.URL_REJECTED)
@@ -384,7 +391,7 @@ class Broker:
             if index:
                 self.count_attempt()
             try:
-                return await self.fetch_address(target, address, method)
+                return await self.fetch_address(target, address, method, subresource=subresource)
             except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
                 if index == len(addresses) - 1:
                     raise PublicError(Failure.RENDER_FAILED) from exc
@@ -392,7 +399,9 @@ class Broker:
                 raise PublicError(Failure.RENDER_FAILED) from exc
         raise PublicError(Failure.RENDER_FAILED)
 
-    async def fetch_address(self, target: ValidatedTarget, address: str, method: str) -> Document:
+    async def fetch_address(
+        self, target: ValidatedTarget, address: str, method: str, *, subresource: bool = False
+    ) -> Document:
         original = httpx.URL(target.url)
         pinned = original.copy_with(host=address)
         hostname = original.raw_host.decode("ascii")
@@ -421,12 +430,26 @@ class Broker:
             if declared.isdigit() and int(declared) > LIMITS.response_bytes:
                 raise PublicError(Failure.TOO_LARGE)
             body = bytearray()
-            # Read raw bytes so no HTTPX decompressor can allocate before our cap.
-            async for chunk in response.aiter_raw(chunk_size=65_536):
-                body.extend(chunk)
-                self.bytes += len(chunk)
-                if len(body) > LIMITS.response_bytes or self.bytes > LIMITS.crawl_bytes:
-                    raise PublicError(Failure.TOO_LARGE)
+            body_seconds = (
+                min(
+                    SUBRESOURCE_BODY_SECONDS,
+                    max(0, self.deadline - asyncio.get_running_loop().time()) / 2,
+                )
+                if subresource
+                else None
+            )
+            try:
+                async with asyncio.timeout(body_seconds) as body_timeout:
+                    # Read raw bytes so no HTTPX decompressor can allocate before our cap.
+                    async for chunk in response.aiter_raw(chunk_size=65_536):
+                        body.extend(chunk)
+                        self.bytes += len(chunk)
+                        if len(body) > LIMITS.response_bytes or self.bytes > LIMITS.crawl_bytes:
+                            raise PublicError(Failure.TOO_LARGE)
+            except TimeoutError as exc:
+                if not body_timeout.expired():
+                    raise
+                raise SubresourceBodyTimeout from exc
             return Document(target.url, response.status_code, dict(response.headers), bytes(body))
 
     async def document(self, url: str) -> Document:
@@ -500,7 +523,9 @@ class Enforcement:
                     and request.frame == request.frame.page.main_frame
                 ):
                     raise PublicError(Failure.NAVIGATION_REJECTED)
-                document = await self.broker.fetch(request.url, request.method)
+                document = await self.broker.fetch(
+                    request.url, request.method, subresource=request.resource_type != "document"
+                )
             # Redirects are followed only by document prefetch, never by the browser.
             if 300 <= document.status < 400:
                 await route.abort("blockedbyclient")
@@ -519,12 +544,13 @@ class Enforcement:
             if request.resource_type == "document":
                 headers["content-security-policy"] = CSP
             await route.fulfill(status=document.status, headers=headers, body=document.body)
+        except SubresourceBodyTimeout:
+            await route.abort("blockedbyclient")
         except PublicError as exc:
             # A subresource the broker cannot decode (a content-encoding despite
             # accept-encoding: identity) is dropped alone: only that request is
             # aborted and the page renders without the asset instead of failing
-            # the whole read. Every other PublicError, and any failure on a
-            # document request, still fails the read.
+            # the whole read. Other PublicErrors still fail the read.
             if exc.failure is Failure.UNSUPPORTED_ENCODING and request.resource_type != "document":
                 await route.abort("blockedbyclient")
                 return
@@ -839,7 +865,7 @@ async def run_public_scrape(url: str, timeout: float, records: Records) -> Publi
             policy_path = root / "firefox-policies.json"
             policy_path.write_text(json.dumps(NATIVE_POLICY), encoding="utf-8")
             os.environ["PLAYWRIGHT_FIREFOX_POLICIES_JSON"] = str(policy_path)
-            broker = Broker()
+            broker = Broker(deadline)
             try:
                 async with asyncio.timeout_at(deadline):
                     records.emit(Stage.FETCH, Event.START)
