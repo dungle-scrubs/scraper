@@ -138,7 +138,9 @@ class PublicError(Exception):
         if "ENFORCEMENT_UNAVAILABLE" in repr(failure) or "enforcement_unavailable" in str(failure):
             _s.stderr.write(
                 "DBG raise "
-                + " | ".join(l.strip().replace(chr(10), " ") for l in _t.format_stack()[-4:-1])
+                + " | ".join(
+                    frame.strip().replace(chr(10), " ") for frame in _t.format_stack()[-4:-1]
+                )
                 + chr(10)
             )
         self.failure = failure
@@ -476,7 +478,9 @@ class Enforcement:
 
             _s.stderr.write(
                 "DBG set "
-                + " | ".join(l.strip().replace(chr(10), " ") for l in _t.format_stack()[-4:-1])
+                + " | ".join(
+                    frame.strip().replace(chr(10), " ") for frame in _t.format_stack()[-4:-1]
+                )
                 + chr(10)
             )
         object.__setattr__(self, name, value)
