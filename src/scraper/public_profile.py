@@ -133,7 +133,13 @@ class Failure(StrEnum):
 class PublicError(Exception):
     def __init__(self, failure: Failure):
         import sys as _s, traceback as _t
-        if "ENFORCEMENT_UNAVAILABLE" in repr(failure) or "enforcement_unavailable" in str(failure): _s.stderr.write("DBG raise " + " | ".join(l.strip().replace(chr(10)," ") for l in _t.format_stack()[-4:-1]) + chr(10))
+
+        if "ENFORCEMENT_UNAVAILABLE" in repr(failure) or "enforcement_unavailable" in str(failure):
+            _s.stderr.write(
+                "DBG raise "
+                + " | ".join(l.strip().replace(chr(10), " ") for l in _t.format_stack()[-4:-1])
+                + chr(10)
+            )
         self.failure = failure
         super().__init__(failure.value)
 
@@ -465,7 +471,12 @@ class Enforcement:
     def __setattr__(self, name, value):
         if name == "failure" and value is not None and "enforcement_unavailable" in str(value):
             import sys as _s, traceback as _t
-            _s.stderr.write("DBG set " + " | ".join(l.strip().replace(chr(10)," ") for l in _t.format_stack()[-4:-1]) + chr(10))
+
+            _s.stderr.write(
+                "DBG set "
+                + " | ".join(l.strip().replace(chr(10), " ") for l in _t.format_stack()[-4:-1])
+                + chr(10)
+            )
         object.__setattr__(self, name, value)
 
     def __init__(self, broker: Broker, document: Document, policy_path: Path, records: Records):
