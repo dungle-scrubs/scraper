@@ -36,6 +36,38 @@ from scraper.safety import UrlRejected, ValidatedTarget, _format_netloc, validat
 PROFILE_ID = "public/v1"
 DEBUG = False
 CSP = "sandbox allow-scripts; worker-src 'none'; frame-src 'none'; child-src 'none'; object-src 'none'"
+# The sandbox CSP keeps every product document on an opaque origin, where the
+# native window.localStorage, window.sessionStorage and document.cookie
+# accessors throw SecurityError; many single-page applications read them at
+# startup and crash before rendering anything. Rather than relaxing the
+# sandbox (no allow-same-origin, no cookie policy change), every document gets
+# memory-only shims: both storage names become own configurable getters on
+# window returning a per-document in-memory Storage-like object, and the
+# cookie accessor reads empty and discards writes. Nothing persists to disk,
+# nothing leaves the page, and every new document starts empty.
+SANDBOX_STORAGE_INIT_SCRIPT = """\
+(() => {
+    const install = (name) => {
+        const entries = new Map();
+        const storage = {
+            get length() { return entries.size; },
+            key(index) { return Array.from(entries.keys())[index] ?? null; },
+            getItem(key) { return entries.get(String(key)) ?? null; },
+            setItem(key, value) { entries.set(String(key), String(value)); },
+            removeItem(key) { entries.delete(String(key)); },
+            clear() { entries.clear(); },
+        };
+        Object.defineProperty(window, name, { configurable: true, get: () => storage });
+    };
+    install("localStorage");
+    install("sessionStorage");
+    Object.defineProperty(Document.prototype, "cookie", {
+        configurable: true,
+        get: () => "",
+        set: () => {},
+    });
+})();
+"""
 # Playwright 1.60's native Firefox policy provider reads this file before UI startup.
 NATIVE_POLICY = {
     "policies": {
@@ -488,6 +520,14 @@ class Enforcement:
                 headers["content-security-policy"] = CSP
             await route.fulfill(status=document.status, headers=headers, body=document.body)
         except PublicError as exc:
+            # A subresource the broker cannot decode (a content-encoding despite
+            # accept-encoding: identity) is dropped alone: only that request is
+            # aborted and the page renders without the asset instead of failing
+            # the whole read. Every other PublicError, and any failure on a
+            # document request, still fails the read.
+            if exc.failure is Failure.UNSUPPORTED_ENCODING and request.resource_type != "document":
+                await route.abort("blockedbyclient")
+                return
             self.failure = self.failure or exc.failure
             await route.abort("blockedbyclient")
         except Exception:
@@ -572,6 +612,9 @@ class Enforcement:
             self.page = page
             page.on("framenavigated", self.navigated)
             await context.route("**/*", self.route)
+            # Install after readiness so the trusted readiness document keeps
+            # observing the native accessors, not the shims.
+            await context.add_init_script(SANDBOX_STORAGE_INIT_SCRIPT)
             self.installed = True
         except asyncio.CancelledError:
             self.records.emit(Stage.ENFORCEMENT, Event.END, Failure.CANCELLED)

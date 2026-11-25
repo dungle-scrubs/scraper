@@ -238,6 +238,12 @@ def resolve(host):
 patch.object(safety, "_default_resolver", resolve).start()
 
 ARTICLE = "The amber telescope discovered seven quiet moons beyond the violet planet."
+STORAGE_APP = """const before=localStorage.getItem('persisted');
+localStorage.setItem('persisted','present');
+sessionStorage.setItem('session','present');
+const p=document.createElement('p');p.id='storage';
+p.textContent='storage '+(before===null?'fresh':'stale')+' name='+localStorage.getItem('persisted')+' session='+sessionStorage.getItem('session')+' cookieEmpty='+(document.cookie==='');
+document.body.append(p);"""
 SCRIPT = """document.body.dataset.fragment=location.hash;
 fetch('/article.json').then(r=>r.json()).then(d=>{
  const a=document.createElement('article');
@@ -248,12 +254,12 @@ fetch('/article.json').then(r=>r.json()).then(d=>{
 });"""
 POLICY = """(async()=>{
  const report=[];
- try{document.cookie='script=synthetic; Secure; SameSite=None';report.push('cookie='+document.cookie)}
+ try{document.cookie='script=synthetic; Secure; SameSite=None';report.push('cookie='+(document.cookie===''?'silent':'unexpected'))}
  catch(e){report.push('cookie='+e.name)}
  for(const key of ['RTCPeerConnection','webkitRTCPeerConnection','WebTransport']) {
    report.push(key+'='+typeof window[key]);
  }
- try{localStorage.setItem('probe','synthetic');report.push('storage=unexpected')}catch(e){report.push('storage='+e.name)}
+ try{localStorage.setItem('probe','synthetic');report.push('storage='+(localStorage.getItem('probe')==='synthetic'?'memory':'unexpected'))}catch(e){report.push('storage='+e.name)}
  document.addEventListener('securitypolicyviolation',e=>{
    if(e.violatedDirective==='worker-src')report.push('worker-csp=blocked');
  });
@@ -375,6 +381,20 @@ async def respond(request):
             headers["content-length"] = "5000001"
         else:
             body = "x" * 5_000_001
+    elif path == "/storage-app":
+        # The storage accessors run before any content exists, so a sandboxed
+        # document without the memory-only shims renders nothing at all.
+        body = (
+            "<!doctype html><html><head></head><body><script>"
+            + STORAGE_APP
+            + "</script></body></html>"
+        )
+    elif path == "/encoded-asset":
+        body = body.replace("</head>", '<script src="/gzipped.js"></script></head>')
+    elif path == "/gzipped.js":
+        headers["content-type"] = "application/javascript"
+        headers["content-encoding"] = "gzip"
+        body = "console.log('synthetic')"
     elif path == "/bot":
         body = "<html><body><p>cf-browser-verification Please wait for the synthetic browser verification challenge to complete before proceeding.</p></body></html>"
     elif path == "/wrong-type":
