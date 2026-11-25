@@ -126,10 +126,12 @@ and `error` contain the same stable code. There is one attempt and no fallback.
 
 The table lists every public failure code. Errors never include upstream
 exception text or a rejected URL. A failed subresource fetch fails the whole
-page with empty content fields, with one exception: a subresource whose
-response carries a content encoding the broker cannot decode is dropped alone,
-and the page renders without that asset. Public mode does not return
-best-effort success with partial content after any other subresource failure.
+page with empty content fields, with two exceptions: an undecodable content
+encoding or an expired total body-read deadline drops only that asset, and
+navigation continues. Each subresource body gets at most 5 seconds or half the
+remaining operation budget, whichever is smaller. These exceptions add no
+partial-page flag. Documents keep the operation deadline. Other subresource
+failures still fail the whole page.
 
 ### Public profile isolation
 

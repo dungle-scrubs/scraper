@@ -585,6 +585,52 @@ def test_undecodable_subresource_is_dropped_alone_without_failing_the_read(tmp_p
     assert boundary["counts"] == {"tcp": 0, "udp": 0}
 
 
+def _stall_bootstrap() -> str:
+    from tests.public_cli_fixture_stall import STALL_ROUTES, STALL_SETUP
+
+    text = BOOTSTRAP.replace(
+        "async def respond(request):", STALL_SETUP + "async def respond(request):", 1
+    )
+    text = text.replace('    elif path == "/bot":', STALL_ROUTES + '    elif path == "/bot":', 1)
+    return text.replace("lambda: httpx.MockTransport(respond)", "StalledBodyTransport", 1)
+
+
+def test_stalled_subresource_body_is_dropped_before_the_operation_deadline(tmp_path: Path) -> None:
+    started = time.monotonic()
+    completed, boundary = run_cli(
+        tmp_path,
+        "https://fixture.test/stalled-asset",
+        "--timeout",
+        "15",
+        bootstrap=_stall_bootstrap(),
+    )
+    elapsed = time.monotonic() - started
+    stalled = json.loads((tmp_path / "stalled-body.json").read_text())
+    assert stalled["sent"] == 65536
+    assert elapsed < 10, (elapsed, completed.stderr)
+    assert completed.returncode == 0, completed.stderr
+    assert stalled["closed"] is True
+    result = json.loads(completed.stdout)
+    assert result["ok"] is True and result["failure"] is None
+    assert ARTICLE in result["markdown"]
+    assert f"<p>{ARTICLE}</p>" in result["html"]
+    assert boundary["counts"] == {"tcp": 0, "udp": 0}
+
+
+def test_stalled_document_body_keeps_the_operation_timeout(tmp_path: Path) -> None:
+    completed, _boundary = run_cli(
+        tmp_path,
+        "https://fixture.test/stalled-document",
+        "--timeout",
+        "2",
+        bootstrap=_stall_bootstrap(),
+    )
+    assert completed.returncode == 3, completed.stderr
+    result = json.loads(completed.stdout)
+    assert result["failure"] == "timeout"
+    assert not result["html"] and not result["markdown"]
+
+
 def test_unexpected_encoding_is_rejected_before_reading_or_decoding_the_body(tmp_path):
     completed, boundary = run_cli(tmp_path, "https://fixture.test/encoding-trap")
     assert completed.returncode == 1, completed.stderr
