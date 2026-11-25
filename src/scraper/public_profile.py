@@ -614,7 +614,6 @@ class Enforcement:
             await context.route("**/*", self.route)
             # Install after readiness so the trusted readiness document keeps
             # observing the native accessors, not the shims.
-            await context.add_init_script(SANDBOX_STORAGE_INIT_SCRIPT)
             self.installed = True
         except asyncio.CancelledError:
             self.records.emit(Stage.ENFORCEMENT, Event.END, Failure.CANCELLED)
