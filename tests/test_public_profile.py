@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -721,3 +722,86 @@ def test_readiness_failure_records_the_trusted_stage_and_cleanup(tmp_path):
     ]
     assert boundary["counts"] == {"tcp": 0, "udp": 0}
     assert len(boundary["requests"]) == 1
+
+
+PDFTOTEXT = shutil.which("pdftotext")
+needs_pdftotext = pytest.mark.skipif(
+    PDFTOTEXT is None, reason="poppler's pdftotext is not installed"
+)
+
+
+def pdf_env():
+    assert PDFTOTEXT is not None
+    return {"PATH": f"{Path(PDFTOTEXT).parent}:/usr/bin:/bin:/usr/sbin:/sbin"}
+
+
+@needs_pdftotext
+@pytest.mark.parametrize(
+    "path,text",
+    [
+        ("/report.pdf", "The amber report, page one.\n\nPage three ends it."),
+        ("/download", "A generic download."),
+    ],
+)
+def test_a_pdf_is_read_as_text_without_a_browser(tmp_path, path, text):
+    completed, boundary = run_cli(tmp_path, f"https://fixture.test{path}", extra_env=pdf_env())
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout)
+    assert result["ok"] is True and result["failure"] is None
+    assert result["markdown"] == text and result["html"] == ""
+    assert result["source"] == "pdftotext" and result["attempts"] == ["pdftotext public"]
+    assert result["final_url"] == f"https://fixture.test{path}"
+    stages = [
+        (e["stage"], e["event"], e["outcome"])
+        for e in map(json.loads, completed.stderr.splitlines())
+    ]
+    assert ("pdf", "end", "ok") in stages
+    assert not any(stage == "browser" for stage, _, _ in stages)
+    assert boundary["counts"] == {"tcp": 0, "udp": 0}
+    assert len(boundary["requests"]) == 1
+
+
+@needs_pdftotext
+@pytest.mark.parametrize(
+    "path,failure",
+    [
+        ("/scan.pdf", "no_text"),
+        ("/broken.pdf", "render_failed"),
+        ("/archive", "unsupported_content"),
+        ("/wrong-type", "unsupported_content"),
+    ],
+)
+def test_a_pdf_without_text_or_a_file_that_is_not_one_fails_typed(tmp_path, path, failure):
+    completed, _ = run_cli(tmp_path, f"https://fixture.test{path}", extra_env=pdf_env())
+    assert completed.returncode == 1, completed.stderr
+    result = json.loads(completed.stdout)
+    assert result["failure"] == failure and result["markdown"] == "" and result["url"] == ""
+
+
+def test_a_pdf_is_unsupported_when_pdftotext_is_not_on_the_callers_path(tmp_path):
+    completed, _ = run_cli(tmp_path, "https://fixture.test/report.pdf?no-pdftotext")
+    assert completed.returncode == 1, completed.stderr
+    assert json.loads(completed.stdout)["failure"] == "unsupported_content"
+
+
+@needs_pdftotext
+def test_a_pdf_whose_text_expands_past_the_cap_keeps_a_bounded_prefix(tmp_path):
+    completed, _ = run_cli(tmp_path, "https://fixture.test/huge.pdf", extra_env=pdf_env())
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout)
+    assert result["ok"] is True
+    assert len(result["markdown"]) == 1_000_000 and result["markdown"].startswith("word word")
+
+
+@needs_pdftotext
+def test_a_pdf_read_past_the_deadline_is_killed_and_typed_as_timeout(tmp_path):
+    completed, _ = run_cli(
+        tmp_path, "--timeout", "1", "https://fixture.test/huge.pdf", extra_env=pdf_env()
+    )
+    assert completed.returncode == 3, completed.stderr
+    assert json.loads(completed.stdout)["failure"] == "timeout"
+    stages = [
+        (e["stage"], e["event"], e.get("outcome"))
+        for e in map(json.loads, completed.stderr.splitlines())
+    ]
+    assert ("pdf", "end", "timeout") in stages

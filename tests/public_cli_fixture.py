@@ -9,6 +9,7 @@ import socket
 import sys
 import threading
 import time
+import zlib
 from pathlib import Path
 from unittest.mock import patch
 
@@ -292,6 +293,80 @@ class EncodingTrap(httpx.AsyncByteStream):
         yield b""  # pragma: no cover
 
 
+def pdf_of(pages):
+    """A small valid PDF whose pages hold these lines; an empty page has no text layer."""
+    objects = ["", "", "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+    kids = []
+    for text in pages:
+        stream = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET" if text else ""
+        objects.append(f"<< /Length {len(stream)} >>\nstream\n{stream}\nendstream")
+        objects.append(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            f"/Resources << /Font << /F1 3 0 R >> >> /Contents {len(objects)} 0 R >>"
+        )
+        kids.append(len(objects))
+    objects[0] = "<< /Type /Catalog /Pages 2 0 R >>"
+    objects[1] = (
+        f"<< /Type /Pages /Kids [{' '.join(f'{k} 0 R' for k in kids)}] /Count {len(kids)} >>"
+    )
+    out = "%PDF-1.4\n"
+    offsets = []
+    for index, body in enumerate(objects):
+        offsets.append(len(out))
+        out += f"{index + 1} 0 obj\n{body}\nendobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n"
+    out += "".join(f"{at:010d} 00000 n \n" for at in offsets)
+    out += f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+    return out
+
+
+def huge_pdf():
+    """A small PDF of 100 pages sharing one compressed stream, expanding past the text cap."""
+    stream = zlib.compress(("BT /F1 1 Tf 0 0 Td (" + "word " * 1_000_000 + ") Tj ET").encode())
+    head = "%PDF-1.4\n"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids ["
+        + b" ".join(b"%d 0 R" % (6 + n) for n in range(100))
+        + b"] /Count 100 >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 99999 99999] "
+        b"/Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Length %d /Filter /FlateDecode >>\nstream\n" % len(stream) + stream + b"\nendstream",
+    ]
+    objects += [objects[3]] * 100
+    out = bytearray(head.encode())
+    offsets = []
+    for index, body in enumerate(objects):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % (index + 1) + body + b"\nendobj\n"
+    xref = len(out)
+    out += (
+        b"xref\n0 %d\n0000000000" % (len(objects) + 1)
+        + b" 65535 f \n"
+        + b"".join(b"%010d 00000 n \n" % at for at in offsets)
+    )
+    out += (
+        b"trailer\n<< /Size %d /Root" % (len(objects) + 1)
+        + b" 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % xref
+    )
+    return out.decode("latin1")
+
+
+PDFS = {
+    "/huge.pdf": ("application/pdf", huge_pdf()),
+    "/report.pdf": (
+        "application/pdf",
+        pdf_of(["The amber report, page one.", "", "Page three ends it."]),
+    ),
+    "/download": ("application/octet-stream", pdf_of(["A generic download."])),
+    "/scan.pdf": ("application/pdf", pdf_of(["", ""])),
+    "/broken.pdf": ("application/pdf", "%PDF-1.4\nnot really a document"),
+    "/archive": ("application/octet-stream", "PK\x03\x04 not a PDF"),
+}
+
+
 async def respond(request):
     REQUESTS.append(
         {
@@ -377,6 +452,8 @@ async def respond(request):
             body = "x" * 5_000_001
     elif path == "/bot":
         body = "<html><body><p>cf-browser-verification Please wait for the synthetic browser verification challenge to complete before proceeding.</p></body></html>"
+    elif path in PDFS:
+        headers["content-type"], body = PDFS[path]
     elif path == "/wrong-type":
         headers["content-type"] = "application/pdf"
     elif path == "/http-error":
@@ -406,12 +483,18 @@ async def respond(request):
             "/loop": "/loop",
             "/asset-redirect": TCP_URL + "/redirect-target",
         }[path]
-    return httpx.Response(status, headers=headers, stream=httpx.ByteStream(body.encode()))
+    return httpx.Response(
+        status,
+        headers=headers,
+        stream=httpx.ByteStream(body.encode("latin1" if path in PDFS else "utf-8")),
+    )
 
 
 patch.object(public, "_open_transport", lambda: httpx.MockTransport(respond)).start()
 
 # Narrow faults do not prove support. They prove the public path refuses a lost capability.
+if "https://fixture.test/report.pdf?no-pdftotext" in ARGS:
+    patch.object(public, "_pdftotext_locator", lambda: None).start()
 if "https://fixture.test/fault-runtime" in ARGS:
     version = public.importlib.metadata.version
     patch.object(

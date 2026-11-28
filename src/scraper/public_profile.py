@@ -14,6 +14,7 @@ import ipaddress
 import json
 import logging
 import os
+import shutil
 import signal
 import socket
 import sys
@@ -89,6 +90,9 @@ NATIVE_POLICY = {
         },
     }
 }
+# A PDF is read by poppler's pdftotext, never the browser, and keeps this much of its output.
+PDF_TYPES = ("application/pdf", "application/octet-stream")
+PDF_TEXT_BYTES = 4_000_000
 READINESS_URL = "https://public-profile.invalid/readiness"
 READINESS_WS = "wss://public-profile.invalid/readiness"
 
@@ -123,6 +127,7 @@ class Failure(StrEnum):
     UNSUPPORTED_CONTENT = "unsupported_content"
     UNSUPPORTED_ENCODING = "unsupported_encoding"
     TOO_LARGE = "too_large"
+    NO_TEXT = "no_text"
     BOT_DETECTED = "bot_detected"
     RENDER_FAILED = "render_failed"
     ENFORCEMENT_UNAVAILABLE = "enforcement_unavailable"
@@ -192,6 +197,7 @@ class Stage(StrEnum):
     PUBLIC = "public"
     FETCH = "fetch"
     BROWSER = "browser"
+    PDF = "pdf"
     ENFORCEMENT = "enforcement"
     CLEANUP = "cleanup"
     BROKER = "broker"
@@ -468,13 +474,98 @@ class Broker:
                 continue
             if not 200 <= document.status < 300:
                 raise PublicError(Failure.HTTP_STATUS)
-            if document.headers.get("content-type", "").split(";", 1)[0].strip().lower() not in (
-                "text/html",
-                "application/xhtml+xml",
+            if _media_type(document) not in ("text/html", "application/xhtml+xml") and not _is_pdf(
+                document
             ):
                 raise PublicError(Failure.UNSUPPORTED_CONTENT)
             return document
         raise PublicError(Failure.REDIRECT_REJECTED)
+
+
+def _media_type(document: Document) -> str:
+    return document.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+
+
+def _is_pdf(document: Document) -> bool:
+    # A PDF is typed as one, or typed as generic bytes, and starts like one.
+    return _media_type(document) in PDF_TYPES and b"%PDF-" in document.body[:1024]
+
+
+def _pdftotext_locator() -> str | None:
+    # Resolved from the caller's PATH before isolation replaces it.
+    return shutil.which("pdftotext")
+
+
+async def _read_pdf(body: bytes, pdftotext: str, deadline: float, records: Records) -> str:
+    """The PDF's text layer, read by poppler's pdftotext with no browser."""
+    outcome: Outcome = Failure.INTERNAL
+    records.emit(Stage.PDF, Event.START)
+    try:
+        async with asyncio.timeout_at(deadline):
+            process = await asyncio.create_subprocess_exec(
+                pdftotext,
+                "-q",
+                "-enc",
+                "UTF-8",
+                "-",
+                "-",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            capped = False
+            status = 0
+            feeding: asyncio.Task[None] | None = None
+            try:
+                assert process.stdin is not None and process.stdout is not None
+
+                async def feed() -> None:
+                    assert process.stdin is not None
+                    with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                        process.stdin.write(body)
+                        await process.stdin.drain()
+                    process.stdin.close()
+
+                feeding = asyncio.create_task(feed())
+                text = bytearray()
+                # Compressed pages can expand far beyond the file; stop at the cap.
+                while len(text) <= PDF_TEXT_BYTES and (chunk := await process.stdout.read(65_536)):
+                    text.extend(chunk)
+                capped = len(text) > PDF_TEXT_BYTES
+                if capped:
+                    process.kill()
+                await feeding
+                status = await process.wait()
+            finally:
+                if process.returncode is None:
+                    process.kill()
+                    await process.wait()
+                if feeding is not None and not feeding.done():
+                    feeding.cancel()
+        if not capped and status != 0:
+            raise PublicError(Failure.RENDER_FAILED)
+        pages = (
+            page.strip() for page in text[:PDF_TEXT_BYTES].decode("utf-8", "ignore").split("\f")
+        )
+        markdown = "\n\n".join(page for page in pages if page)[: LIMITS.markdown_chars]
+        if not markdown:
+            raise PublicError(Failure.NO_TEXT)
+        outcome = "ok"
+        return markdown
+    except PublicError as exc:
+        outcome = exc.failure
+        raise
+    except TimeoutError:
+        outcome = Failure.TIMEOUT
+        raise
+    except asyncio.CancelledError:
+        outcome = Failure.CANCELLED
+        raise
+    except OSError as exc:
+        outcome = Failure.RENDER_FAILED
+        raise PublicError(Failure.RENDER_FAILED) from exc
+    finally:
+        records.emit(Stage.PDF, Event.END, outcome)
 
 
 def _request_key(url: str) -> tuple[str, bytes, int | None, bytes]:
@@ -861,6 +952,7 @@ async def run_public_scrape(url: str, timeout: float, records: Records) -> Publi
             raise PublicError(Failure.INVALID_INPUT)
         deadline = asyncio.get_running_loop().time() + timeout
         _check_runtime()
+        pdftotext = _pdftotext_locator()
         with isolate_process() as root, _vendor_output():
             policy_path = root / "firefox-policies.json"
             policy_path.write_text(json.dumps(NATIVE_POLICY), encoding="utf-8")
@@ -881,9 +973,16 @@ async def run_public_scrape(url: str, timeout: float, records: Records) -> Publi
                         records.emit(Stage.FETCH, Event.END, Failure.INTERNAL)
                         raise
                     records.emit(Stage.FETCH, Event.END, "ok")
-                html, markdown, final_url = await _render(
-                    document, broker, records, deadline, policy_path
-                )
+                if _is_pdf(document):
+                    if pdftotext is None:
+                        raise PublicError(Failure.UNSUPPORTED_CONTENT)
+                    html, final_url, source = "", document.url, "pdftotext"
+                    markdown = await _read_pdf(document.body, pdftotext, deadline, records)
+                else:
+                    html, markdown, final_url = await _render(
+                        document, broker, records, deadline, policy_path
+                    )
+                    source = "crawl4ai"
             finally:
                 records.counters(broker.requests, broker.bytes)
         result = PublicResult(
@@ -892,9 +991,9 @@ async def run_public_scrape(url: str, timeout: float, records: Records) -> Publi
             final_url=final_url,
             html=html,
             markdown=markdown,
-            source="crawl4ai",
+            source=source,
             elapsed_ms=(time.monotonic() - started) * 1000,
-            attempts=["crawl4ai public"],
+            attempts=[f"{source} public"],
         )
     except asyncio.CancelledError:
         result = failure_result(Failure.CANCELLED, (time.monotonic() - started) * 1000)

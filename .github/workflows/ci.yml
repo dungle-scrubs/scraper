@@ -34,6 +34,9 @@ jobs:
       - name: Install test browsers
         run: uv run playwright install --with-deps firefox
 
+      - name: Install pdftotext for the public profile's PDF tests
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends poppler-utils
+
       - name: Test
         run: uv run pytest tests/ -v
 
