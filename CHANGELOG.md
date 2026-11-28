@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.2.2](https://github.com/dungle-scrubs/scraper/compare/v0.2.1...v0.2.2) (2026-11-28)
+
+
+### Added
+
+* add an isolated public CLI scrape profile ([#40](https://github.com/dungle-scrubs/scraper/issues/40)) ([e30b14f](https://github.com/dungle-scrubs/scraper/commit/e30b14f2aecbbe771e6b71092019cc81b104c476))
+* **public:** read a public PDF link as text with pdftotext ([#63](https://github.com/dungle-scrubs/scraper/issues/63)) ([eb6b394](https://github.com/dungle-scrubs/scraper/commit/eb6b394098d1aead2eae55e1a1bfd2f473e2804a))
+
+
+### Fixed
+
+* accept a history update that keeps the public page's URL ([#55](https://github.com/dungle-scrubs/scraper/issues/55)) ([afc6e1f](https://github.com/dungle-scrubs/scraper/commit/afc6e1f6e569a3c9252f69eed8b4e1532e1f4418))
+* enforce patched runtime dependency floors ([655c7e4](https://github.com/dungle-scrubs/scraper/commit/655c7e40e01e8dadf944a30b072629586599c265))
+* pin CI to the supported Ubuntu 24.04 runner ([#41](https://github.com/dungle-scrubs/scraper/issues/41)) ([ead154b](https://github.com/dungle-scrubs/scraper/commit/ead154b83db646db5ea8e6a0d792e13cf858c32a))
+* **public:** bound subresource body reads ([#61](https://github.com/dungle-scrubs/scraper/issues/61)) ([5942028](https://github.com/dungle-scrubs/scraper/commit/59420282415fdd4c551dd2c473b3026b06170898))
+* **public:** memory-only storage for sandboxed pages; drop undecodable subresources alone ([#57](https://github.com/dungle-scrubs/scraper/issues/57)) ([66bb413](https://github.com/dungle-scrubs/scraper/commit/66bb4135c27fed37f3fe322a106cf8694a3bcac1))
+* raise nltk and soupsieve floors past new advisories ([#56](https://github.com/dungle-scrubs/scraper/issues/56)) ([fd9eac1](https://github.com/dungle-scrubs/scraper/commit/fd9eac1378810961c58e637166282ef334a27b0e))
+
+
+### Maintenance
+
+* build and publish with uv, attest via attest-action ([#30](https://github.com/dungle-scrubs/scraper/issues/30)) ([4bc2aee](https://github.com/dungle-scrubs/scraper/commit/4bc2aeec638281e01021bdeefba4367075310ebc))
+
 ## [0.2.1](https://github.com/dungle-scrubs/scraper/compare/v0.2.0...v0.2.1) (2026-09-09)
 
 
