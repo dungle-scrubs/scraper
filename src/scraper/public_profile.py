@@ -515,6 +515,7 @@ async def _read_pdf(body: bytes, pdftotext: str, deadline: float, records: Recor
             )
             capped = False
             status = 0
+            feeding: asyncio.Task[None] | None = None
             try:
                 assert process.stdin is not None and process.stdout is not None
 
@@ -539,6 +540,8 @@ async def _read_pdf(body: bytes, pdftotext: str, deadline: float, records: Recor
                 if process.returncode is None:
                     process.kill()
                     await process.wait()
+                if feeding is not None and not feeding.done():
+                    feeding.cancel()
         if not capped and status != 0:
             raise PublicError(Failure.RENDER_FAILED)
         pages = (

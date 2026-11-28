@@ -779,7 +779,7 @@ def test_a_pdf_without_text_or_a_file_that_is_not_one_fails_typed(tmp_path, path
 
 
 def test_a_pdf_is_unsupported_when_pdftotext_is_not_on_the_callers_path(tmp_path):
-    completed, _ = run_cli(tmp_path, "https://fixture.test/report.pdf")
+    completed, _ = run_cli(tmp_path, "https://fixture.test/report.pdf?no-pdftotext")
     assert completed.returncode == 1, completed.stderr
     assert json.loads(completed.stdout)["failure"] == "unsupported_content"
 
@@ -791,3 +791,17 @@ def test_a_pdf_whose_text_expands_past_the_cap_keeps_a_bounded_prefix(tmp_path):
     result = json.loads(completed.stdout)
     assert result["ok"] is True
     assert len(result["markdown"]) == 1_000_000 and result["markdown"].startswith("word word")
+
+
+@needs_pdftotext
+def test_a_pdf_read_past_the_deadline_is_killed_and_typed_as_timeout(tmp_path):
+    completed, _ = run_cli(
+        tmp_path, "--timeout", "1", "https://fixture.test/huge.pdf", extra_env=pdf_env()
+    )
+    assert completed.returncode == 3, completed.stderr
+    assert json.loads(completed.stdout)["failure"] == "timeout"
+    stages = [
+        (e["stage"], e["event"], e.get("outcome"))
+        for e in map(json.loads, completed.stderr.splitlines())
+    ]
+    assert ("pdf", "end", "timeout") in stages

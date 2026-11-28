@@ -493,6 +493,8 @@ async def respond(request):
 patch.object(public, "_open_transport", lambda: httpx.MockTransport(respond)).start()
 
 # Narrow faults do not prove support. They prove the public path refuses a lost capability.
+if "https://fixture.test/report.pdf?no-pdftotext" in ARGS:
+    patch.object(public, "_pdftotext_locator", lambda: None).start()
 if "https://fixture.test/fault-runtime" in ARGS:
     version = public.importlib.metadata.version
     patch.object(
