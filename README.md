@@ -59,6 +59,19 @@ The JSON includes `profile: "public/v1"`, `html`, `markdown` and `final_url`.
 links and article structure. Pages that need normal origin privileges, workers,
 frames or authentication can fail or render incompletely under this profile.
 
+### Read a public PDF as text
+
+The same command reads a link that serves a PDF: a response typed
+`application/pdf`, or `application/octet-stream`, whose first 1,024 bytes hold
+`%PDF-`. The browser never opens it. Poppler's `pdftotext` reads its text layer
+from stdin inside the isolated process, within the same deadline. `markdown` is
+the text of its pages, trimmed and separated by blank lines, empty pages
+dropped; `html` is empty and `source` is `pdftotext`. A PDF with no text on any
+page, such as a scan, fails with `no_text`, and one `pdftotext` cannot read
+fails with `render_failed`. `pdftotext` is found on the caller's `PATH` before
+isolation replaces it (`brew install poppler`, or `poppler-utils` on Debian and
+Ubuntu); without it a PDF fails with `unsupported_content`.
+
 ### Send the URL on stdin
 
 ```bash
@@ -111,7 +124,8 @@ existing result fields without the CLI's `ok` field. `source` is `crawl4ai`,
 `jina` or `none`.
 
 The public result adds `profile`, `failure`, `final_url` and `html`.
-On success, `failure` and `error` are null and `source` is `crawl4ai`.
+On success, `failure` and `error` are null and `source` is `crawl4ai`, or
+`pdftotext` for a PDF.
 On failure, content and URL fields are empty, `source` is `none`, and `failure`
 and `error` contain the same stable code. There is one attempt and no fallback.
 `bot_detected` is true for `bot_detected` failures.
@@ -119,7 +133,7 @@ and `error` contain the same stable code. There is one attempt and no fallback.
 | Exit | Default profile | Public profile |
 |---|---|---|
 | 0 | Content scraped | Content scraped |
-| 1 | Backends exhausted | `redirect_rejected`, `navigation_rejected`, `http_status`, `unsupported_content`, `unsupported_encoding`, `too_large`, `bot_detected`, `render_failed`, `cancelled` |
+| 1 | Backends exhausted | `redirect_rejected`, `navigation_rejected`, `http_status`, `unsupported_content`, `unsupported_encoding`, `too_large`, `no_text`, `bot_detected`, `render_failed`, `cancelled` |
 | 2 | Invalid input | `invalid_input`, `url_rejected`, `credentials_in_url` |
 | 3 | Global timeout | `timeout`, including per-target DNS validation and the global deadline |
 | 4 | Internal error | `internal`, `enforcement_unavailable`, `cleanup_failed` |
@@ -234,13 +248,14 @@ No live-source acceptance is claimed.
 | Broker requests | 200 per invocation |
 | Response body | 5,000,000 raw bytes; only identity content encoding accepted |
 | Total broker bodies | 20,000,000 raw bytes |
+| PDF text read from `pdftotext` | 4,000,000 bytes; the rest is not read |
 | Markdown | 1,000,000 characters |
 | Rendered HTML | 2 MiB UTF-8 |
 | JSON stdout including newline | 8 MiB |
 
 HTML or JSON over the limit produces `too_large` with no partial document.
 `--timeout` defaults to 120 seconds and covers public validation, fetching,
-browser startup and rendering. Each target's DNS validation has a 5-second
+browser startup and rendering, or reading a PDF. Each target's DNS validation has a 5-second
 limit. Either a DNS validation timeout or the global deadline produces `timeout`
 and exit code 3. Cleanup has at most 10 additional seconds,
 including an owned-driver stop if normal browser close fails. SIGINT and
